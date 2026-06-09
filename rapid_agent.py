@@ -460,22 +460,103 @@ def tier_of(comp, profile):
     return None
 
 # ============================ RESUME RENDER (Google Docs template) ===========
+# Template {{placeholders}} (discovered from Rapid_Resume_Template.docx):
+#   header  : FULL_NAME HEADLINE EMAIL PHONE LOCATION LINKEDIN
+#   body    : SUMMARY SKILLS
+#   exp blk : JOB_TITLE COMPANY JOB_LOCATION START END BULLET_1 BULLET_2 BULLET_3
+#   edu     : DEGREE INSTITUTION GRAD_YEAR
+#   other   : CERTIFICATIONS
+SKILL_SEP = " • "
+
+def build_resume_fields(tailored, client):
+    """Map the resume-skill output + client identity onto the template's single-occurrence
+    {{placeholders}}. Pure + testable. Uses the first experience/education for the
+    template's single block (extra entries need live block-duplication -- see render_resume).
+    Missing values render as empty strings; truly-empty sections are pruned at render time."""
+    tailored = tailored or {}
+    exp = tailored.get("experience") or []
+    edu = tailored.get("education") or []
+    e0  = exp[0] if exp else {}
+    ed0 = edu[0] if edu else {}
+    bullets = e0.get("bullets") or []
+    def bullet(i): return bullets[i] if i < len(bullets) else ""
+    return {
+        "FULL_NAME":      client.get("name") or "",
+        "HEADLINE":       tailored.get("headline") or "",
+        "EMAIL":          client.get("email") or "",
+        "PHONE":          client.get("phone") or "",
+        "LOCATION":       client.get("location") or "",
+        "LINKEDIN":       client.get("linkedin_url") or "",
+        "SUMMARY":        tailored.get("summary") or "",
+        "SKILLS":         SKILL_SEP.join(tailored.get("skills") or []),
+        "JOB_TITLE":      e0.get("title") or "",
+        "COMPANY":        e0.get("company") or "",
+        "JOB_LOCATION":   e0.get("location") or "",
+        "START":          e0.get("start") or "",
+        "END":            e0.get("end") or "",
+        "BULLET_1":       bullet(0),
+        "BULLET_2":       bullet(1),
+        "BULLET_3":       bullet(2),
+        "DEGREE":         ed0.get("credential") or "",
+        "INSTITUTION":    ed0.get("institution") or "",
+        "GRAD_YEAR":      str(ed0.get("year") or ""),
+        "CERTIFICATIONS": SKILL_SEP.join(tailored.get("certifications") or []),
+    }
+
+def _resume_replace_requests(fields):
+    """Google Docs batchUpdate replaceAllText requests, one per {{placeholder}}. Pure."""
+    return [{"replaceAllText": {"containsText": {"text": f"{{{{{k}}}}}", "matchCase": True},
+                                "replaceText": v}}
+            for k, v in fields.items()]
+
+def _drive_id(url_or_id):
+    """Extract a Google Doc/Drive file id from a share URL, or pass through a bare id. Pure."""
+    m = re.search(r"/d/([A-Za-z0-9_-]+)", url_or_id or "")
+    return m.group(1) if m else (url_or_id or "").strip()
+
+def _google_creds():
+    """Service-account credentials. GOOGLE_SERVICE_ACCOUNT_JSON may be a file PATH or the
+    inline JSON contents (handy for cloud envs)."""
+    from google.oauth2 import service_account
+    raw = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    info = json.loads(raw) if raw.lstrip().startswith("{") else json.load(open(raw))
+    return service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/documents",
+                      "https://www.googleapis.com/auth/drive"])
+
 def render_resume(tailored_content, client):
-    # TODO[DEV]: copy the GLOBAL template Doc (RESUME_TEMPLATE_DOC_ID) and fill its
-    # {{placeholders}} from tailored_content (which already carries all the client's
-    # facts, sourced from base_resume). Do NOT copy the client's master at render
-    # time -- the master's content lives in clients.base_resume already.
-    # NOTE: the template holds ONE experience block with 3 {{BULLET_n}} lines --
-    # duplicate the block per experience entry and per bullet (variable counts),
-    # and remove empty sections (e.g. no certifications) rather than leaving headings.
-    return "https://docs.google.com/document/d/PLACEHOLDER"
+    """Copy the GLOBAL template Doc, merge tailored_content into its {{placeholders}}, write
+    to the output Drive folder, return the shareable link. The client's facts already live in
+    tailored_content/base_resume, so the master is NOT copied here.
+    LIVE-VERIFY (deferred until Google creds + network): rendering >1 experience or >3 bullets
+    needs block-duplication, and empty-section heading removal needs a structural pass; the
+    single-block flat merge below is what the unit tests cover."""
+    from googleapiclient.discovery import build
+    creds = _google_creds()
+    drive = build("drive", "v3", credentials=creds)
+    docs  = build("docs", "v1", credentials=creds)
+    out_folder = os.environ.get("DRIVE_OUTPUT_FOLDER_ID")
+    first_co = (tailored_content.get("experience") or [{}])[0].get("company", "")
+    title = f"{client.get('name','Resume')} - {first_co}".strip(" -")
+    copy = drive.files().copy(
+        fileId=os.environ["RESUME_TEMPLATE_DOC_ID"],
+        body={"name": title, **({"parents": [out_folder]} if out_folder else {})},
+        supportsAllDrives=True).execute()
+    doc_id = copy["id"]
+    fields = build_resume_fields(tailored_content, client)
+    docs.documents().batchUpdate(
+        documentId=doc_id, body={"requests": _resume_replace_requests(fields)}).execute()
+    return f"https://docs.google.com/document/d/{doc_id}/edit"
 
 def refresh_base_resume(client):
-    # TODO[DEV]: read the client's master resume from Drive ONCE (on activation / when the
-    # master changes), normalize to text/structure, and cache it to clients.base_resume.
-    # The master's Doc ID/URL is stored in clients.resume_url at onboarding.
-    # The per-job tailor step reads this cache -- it never re-fetches/re-parses Drive per job.
-    ...
+    """Read the client's master resume from Drive ONCE and return its plain text, for the data
+    layer to cache in clients.base_resume. resume_url holds the master Doc id/url. The per-job
+    tailor step reads that cache -- it never re-fetches Drive per job."""
+    from googleapiclient.discovery import build
+    drive = build("drive", "v3", credentials=_google_creds())
+    data = drive.files().export(
+        fileId=_drive_id(client.get("resume_url")), mimeType="text/plain").execute()
+    return data.decode("utf-8") if isinstance(data, bytes) else data
 
 # ============================ EMAIL ==========================================
 def _email_location(job):

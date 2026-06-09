@@ -22,8 +22,8 @@ status + "verified" notes as each task moves. Build order follows Handoff §8 (1
 | 2 | Apify scrape → shared pool (tag matched_queries; upsert MERGES) | ⬜ | needs APIFY_TOKEN |
 | 3 | Parser helpers (_is_us, _arrangement_compatible, _parse_salary_max) + unit tests | ✅ | 48 tests pass (`python3 -m pytest -q`) |
 | 4 | location_score | ✅ | 66 tests pass total (`python3 -m pytest -q`) |
-| 5 | Google Docs merge (render_resume) + refresh_base_resume | ⬜ | needs GOOGLE_SERVICE_ACCOUNT_JSON + template |
-| 6 | Postmark send + notify_ops | ⬜ | needs POSTMARK_SERVER_TOKEN |
+| 5 | Google Docs merge (render_resume) + refresh_base_resume | 🟡 | pure core tested (build_resume_fields, replace-requests, _drive_id, inline-JSON creds); LIVE Drive/Docs + multi-experience block-duplication + empty-section pruning need Google creds+network |
+| 6 | Postmark send + notify_ops | ✅ | rendering + test-mode safety tested (105 total); live send pending open network |
 | 7 | Harden Claude JSON parsing (strip stray text, validate, retry once) | ✅ | 81 tests pass; prompt caching on skill system prompt too |
 | 8 | Bounded concurrency (idempotent, no double-sends) | ⬜ | |
 | 9 | RLS policies | ⬜ | |
