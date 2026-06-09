@@ -129,28 +129,45 @@ def get_match_profile(client_id):
     return (res.data or [None])[0]
 
 def get_all_active_query_sets():
-    """Deduped union of every active client's title queries x preferred locations x
-    work arrangements, shaped for the Fantastic Jobs actors (titleSearch/locationSearch
-    arrays). Clients in search_mode='expanded' also contribute their expanded_queries.
-    Provenance is re-derived per job from titleSearch (see _query_matches_title), so a
-    single shared scrape keeps each client scoped to jobs their own queries found."""
+    """Query BUCKETS for the shared scrape, one actor run each. A client who accepts
+    REMOTE (or states no arrangement) is searched NATIONALLY -- filtering remote roles
+    by the client's home city starves them (a remote job isn't located in their town).
+    A strictly on-site/hybrid client is searched by their preferred_locations. Returns
+    a list of {titleSearch, locationSearch}; [] when no active clients.
+    Provenance is still re-derived per job from titleSearch (see _query_matches_title),
+    so a job found in any bucket is scored only by the clients whose queries match it."""
     clients = get_active_clients()
     ids = [c["id"] for c in clients]
-    empty = {"titleSearch": [], "locationSearch": [], "workArrangements": []}
     if not ids:
-        return empty
+        return []
     res = (_get_sb().table("match_profiles")
-           .select("title_search_queries,expanded_queries,search_mode,preferred_locations,work_arrangements")
+           .select("title_search_queries,expanded_queries,search_mode,preferred_locations,"
+                   "work_arrangements,geography_constraint")
            .in_("client_id", ids).execute())
-    titles, locs, arr = set(), set(), set()
+    national_titles, located_titles, located_locs = set(), set(), set()
+    us_only_national = True
     for p in res.data or []:
-        titles.update(p.get("title_search_queries") or [])
+        titles = set(p.get("title_search_queries") or [])
         if p.get("search_mode") == "expanded":
-            titles.update(p.get("expanded_queries") or [])
-        locs.update(p.get("preferred_locations") or [])
-        arr.update(p.get("work_arrangements") or [])
-    return {"titleSearch": sorted(titles), "locationSearch": sorted(locs),
-            "workArrangements": sorted(arr)}
+            titles |= set(p.get("expanded_queries") or [])
+        arr = {_norm_arrangement(a) for a in (p.get("work_arrangements") or [])}
+        if not arr or "remote" in arr:                 # remote-accepting -> national search
+            national_titles |= titles
+            if (p.get("geography_constraint") or "US_only") != "US_only":
+                us_only_national = False
+        else:                                          # strictly on-site/hybrid -> by city
+            located_titles |= titles
+            located_locs |= set(p.get("preferred_locations") or [])
+    buckets = []
+    if national_titles:
+        # All current clients are US_only; bias the national run to the US to avoid
+        # paying for clearly-foreign postings the geography prefilter would drop anyway.
+        buckets.append({"titleSearch": sorted(national_titles),
+                        "locationSearch": ["United States"] if us_only_national else []})
+    if located_titles:
+        buckets.append({"titleSearch": sorted(located_titles),
+                        "locationSearch": sorted(located_locs)})
+    return buckets
 
 def get_sent_count_since(client_id, days):
     since = _iso(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days))
@@ -393,40 +410,41 @@ def _normalize_job(item, union_titles):
     job["content_hash"] = content_hash(job)
     return job
 
-def scrape_jobs(query_sets, lookback_hours, limit=None):
-    """Call the Fantastic Jobs actors ONCE over the deduped union of title queries x
-    locations, with a lookback window. Return normalized job dicts:
+def scrape_jobs(buckets, lookback_hours, limit=None):
+    """Call the Fantastic Jobs actors over each query bucket (national + located, from
+    get_all_active_query_sets) with a lookback window. Return normalized job dicts:
     {source, external_job_id, job_title, company, location, is_remote, salary_range,
      job_url, job_description, posted_at, content_hash, matched_queries}.
     Work-arrangement is intentionally NOT filtered here (unknown never kills -- the
-    lenient code prefilter handles it). Each job is tagged with the union queries it
-    matches (provenance); upsert_jobs MERGES those tags on conflict."""
-    titles = query_sets.get("titleSearch") or []
-    locs = query_sets.get("locationSearch") or []
-    if not titles:
+    lenient code prefilter handles it). Each job is tagged with EVERY union query it
+    matches (provenance), regardless of which bucket found it; upsert_jobs MERGES tags."""
+    if isinstance(buckets, dict):                       # back-compat: a single bucket
+        buckets = [buckets]
+    buckets = [b for b in buckets if b.get("titleSearch")]
+    if not buckets:
         return []
     if limit is None:
         limit = int(os.environ.get("RAPID_SCRAPE_LIMIT", SCRAPE_LIMIT_DEFAULT))
-    run_input = {
-        "titleSearch": titles,
-        "locationSearch": locs,
-        "timeRange": _timerange(lookback_hours),
-        "includeAi": True,
-        "descriptionType": "text",
-        "limit": limit,
-    }
+    limit = max(int(limit), 10)                         # the actors require limit >= 10
+    all_titles = sorted({q for b in buckets for q in b["titleSearch"]})   # provenance vocabulary
+    timerange = _timerange(lookback_hours)
     from apify_client import ApifyClient
     client = ApifyClient(os.environ["APIFY_TOKEN"])
     jobs = []
-    for aid in (APIFY_ACTOR_LINKEDIN, APIFY_ACTOR_CAREER):
-        run = client.actor(aid).call(run_input=run_input)
-        ds = _run_dataset_id(run)
-        if not ds:
-            continue
-        for item in client.dataset(ds).iterate_items():
-            nj = _normalize_job(item, titles)
-            if nj:
-                jobs.append(nj)
+    for b in buckets:
+        run_input = {"titleSearch": b["titleSearch"], "timeRange": timerange,
+                     "includeAi": True, "descriptionType": "text", "limit": limit}
+        if b.get("locationSearch"):
+            run_input["locationSearch"] = b["locationSearch"]
+        for aid in (APIFY_ACTOR_LINKEDIN, APIFY_ACTOR_CAREER):
+            run = client.actor(aid).call(run_input=run_input)
+            ds = _run_dataset_id(run)
+            if not ds:
+                continue
+            for item in client.dataset(ds).iterate_items():
+                nj = _normalize_job(item, all_titles)
+                if nj:
+                    jobs.append(nj)
     return jobs
 
 def _run_dataset_id(run):
@@ -828,7 +846,9 @@ def _render_match_email(client, match):
                "💡 This one cleared our 70% quality bar but isn't a slam dunk — you "
                "decide. Your tailored resume is ready either way.")
     if salary:
-        loc_line = f"{location} | 💰 {e(salary)} PER YEAR<br>"
+        # salary already carries its own unit ("... per year"/"per hour"), so don't
+        # append the template's hardcoded "PER YEAR" (would read "per year PER YEAR").
+        loc_line = f"{location} | 💰 {e(salary)}<br>"
     elif location:
         loc_line = f"{location}<br>"
     else:

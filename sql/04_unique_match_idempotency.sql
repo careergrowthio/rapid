@@ -12,3 +12,13 @@
 --    where a.client_id = b.client_id and a.job_id = b.job_id and a.ctid < b.ctid;
 
 create unique index if not exists matches_client_job_uniq on matches (client_id, job_id);
+
+-- ------------------------------------------------------------
+-- Global pool dedup: a job exists once (content_hash). Migration 02 intended this,
+-- but the live table was missing it (PostgREST upsert ON CONFLICT failed). The agent
+-- no longer requires it (upsert_jobs does select-then-insert/merge), but the index
+-- makes dedup bulletproof and speeds the existence lookups. Safe + additive.
+-- If a duplicate hash already exists, de-dupe first (keep newest scraped_at):
+--   delete from jobs a using jobs b
+--    where a.content_hash = b.content_hash and a.scraped_at < b.scraped_at;
+create unique index if not exists jobs_content_hash on jobs (content_hash);

@@ -23,13 +23,33 @@ status + "verified" notes as each task moves. Build order follows Handoff §8 (1
 | 3 | Parser helpers (_is_us, _arrangement_compatible, _parse_salary_max) + unit tests | ✅ | tests pass (`python3 -m pytest -q`) |
 | 4 | location_score | ✅ | tests pass (`python3 -m pytest -q`) |
 | 5 | Google Docs merge (render_resume) + refresh_base_resume | 🔒 | DEFERRED per owner (no GOOGLE_SERVICE_ACCOUNT_JSON). render_resume now raises (no placeholder link can be emailed) |
-| 6 | Postmark send + notify_ops | 🟡 | implemented (HTML render of both variants; hard TEST_RECIPIENT_OVERRIDE). NOT yet sent (needs send go-ahead) |
-| 7 | Harden Claude JSON parsing (strip stray text, validate, retry once) | ✅ | prompt caching on skill system prompt too |
+| 6 | Postmark send + notify_ops | 🟡 | code validated to the API boundary (request shape + auth OK; both variants render). BLOCKED on a human step: confirm sender signature/domain in Postmark (From rapidnotifications@careergrowth.io returns ErrorCode 400 "not a Sender Signature"). |
+| 7 | Harden Claude JSON parsing (strip stray text, validate, retry once) | ✅ | prompt caching on skill system prompt too; + json.dumps(default=str) |
 | 8 | Bounded concurrency (idempotent, no double-sends) | ✅ | ThreadPoolExecutor(RAPID_MAX_WORKERS=5) fan-out; + sql/04 unique (client_id,job_id) index for DB-level idempotency |
-| 9 | RLS policies | 🟡 | sql/05_rls_policies.sql written (default-deny + dashboard sent-only reads). NOT yet applied to live DB |
-| 10 | Deploy + schedule | 🟡 | Dockerfile + docs/DEPLOY.md (Render/Railway hourly cron). NOT yet deployed |
+| 9 | RLS policies | 🟡 | sql/05_rls_policies.sql written (default-deny + dashboard sent-only reads). Human step: run in Supabase SQL Editor (no DDL path from the service key). |
+| 10 | Deploy + schedule | 🟡 | Dockerfile + docs/DEPLOY.md (Render/Railway hourly cron). Human step: create the host service + cron + env vars. |
 
-Total tests: **96 pass** (`python3 -m pytest -q`).
+Total tests: **103 pass** (`python3 -m pytest -q`).
+
+## HUMAN STEPS REMAINING (cannot be done from the agent session)
+1. **Postmark sender** — in Postmark → Sender Signatures, add & confirm
+   `rapidnotifications@careergrowth.io` (or verify the `careergrowth.io` domain with
+   DKIM/Return-Path). Until then every send 422s. After confirming, the email path is
+   done — code already hard-routes To = TEST_RECIPIENT_OVERRIDE.
+2. **Run the SQL patches** in Supabase → SQL Editor: `sql/04_unique_match_idempotency.sql`
+   (matches uniqueness + jobs.content_hash index) and `sql/05_rls_policies.sql` (RLS,
+   before anything client-facing reads the tables). Service key can't run DDL.
+3. **Task 5 (Google Docs resume render)** — still deferred; provide
+   GOOGLE_SERVICE_ACCOUNT_JSON to unblock. Until then `render_resume` raises and
+   delivery leaves an alertable 'pending' row instead of emailing a dead link.
+4. **Deploy** — follow `docs/DEPLOY.md` (Render/Railway hourly cron, env vars).
+
+## Design decision implemented this session
+- **Remote clients search nationally.** `get_all_active_query_sets` now returns query
+  BUCKETS: remote-accepting clients → national `locationSearch=["United States"]`
+  (validated: 10/10 US jobs, vs ~0 when filtered by home city); strictly on-site/hybrid
+  clients → their preferred_locations. Provenance still re-derived from titleSearch.
+  This unblocks acceptance gate #2 for normal (remote) clients.
 
 ## Safety state
 - 🔒 TEST MODE. Every email sends ONLY to TEST_RECIPIENT_OVERRIDE until shadow-run passes.
