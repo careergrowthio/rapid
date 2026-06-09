@@ -24,7 +24,7 @@ status + "verified" notes as each task moves. Build order follows Handoff §8 (1
 | 4 | location_score | ✅ | 66 tests pass total (`python3 -m pytest -q`) |
 | 5 | Google Docs merge (render_resume) + refresh_base_resume | ⬜ | needs GOOGLE_SERVICE_ACCOUNT_JSON + template |
 | 6 | Postmark send + notify_ops | ⬜ | needs POSTMARK_SERVER_TOKEN |
-| 7 | Harden Claude JSON parsing (strip stray text, validate, retry once) | ⬜ | testable offline (mock) |
+| 7 | Harden Claude JSON parsing (strip stray text, validate, retry once) | ✅ | 81 tests pass; prompt caching on skill system prompt too |
 | 8 | Bounded concurrency (idempotent, no double-sends) | ⬜ | |
 | 9 | RLS policies | ⬜ | |
 | 10 | Deploy + schedule | ⬜ | |

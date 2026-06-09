@@ -327,13 +327,70 @@ def _location_band(job_loc, pref_loc):
     return 40
 
 # ============================ CLAUDE CALLS ===================================
-def _call_claude(model, skill, payload, max_tokens=1500):
-    resp = _get_claude().messages.create(
-        model=model, max_tokens=max_tokens, system=skill,   # TODO[DEV]: enable prompt caching on `system`
-        messages=[{"role": "user", "content": json.dumps(payload)}],
-    )
-    text = "".join(b.text for b in resp.content if b.type == "text")
-    return json.loads(text)   # TODO[DEV]: harden parse + retry once
+def _extract_json(text):
+    """Pull a JSON object out of model text: strip code fences and any surrounding
+    prose, then parse. Raises ValueError when nothing parseable is present."""
+    if not text or not text.strip():
+        raise ValueError("empty model response")
+    t = text.strip()
+    fenced = re.search(r'```(?:json)?\s*(.*?)```', t, re.DOTALL)   # ```json ... ```
+    if fenced:
+        t = fenced.group(1).strip()
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        s, e = t.find('{'), t.rfind('}')                          # outermost {...}
+        if 0 <= s < e:
+            return json.loads(t[s:e + 1])
+        raise ValueError("no JSON object found in model response")
+
+def _call_claude(model, skill, payload, max_tokens=1500, validate=None):
+    """Call Claude with the skill as a (prompt-cached) system prompt and return the
+    parsed JSON. Hardened: strip stray text, validate the shape, and retry ONCE with
+    a corrective nudge before giving up."""
+    last_text = last_err = None
+    messages = [{"role": "user", "content": json.dumps(payload)}]
+    for attempt in range(2):                                      # initial try + one retry
+        if attempt:                                               # nudge with the bad reply in context
+            messages = [
+                {"role": "user", "content": json.dumps(payload)},
+                {"role": "assistant", "content": last_text or "{}"},
+                {"role": "user", "content": "That was not valid JSON for the schema. "
+                 "Reply with ONLY the JSON object, no prose and no code fences."},
+            ]
+        resp = _get_claude().messages.create(
+            model=model, max_tokens=max_tokens,
+            system=[{"type": "text", "text": skill,               # prompt-cache the skill
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=messages,
+        )
+        last_text = "".join(b.text for b in resp.content if b.type == "text")
+        try:
+            data = _extract_json(last_text)
+            if validate:
+                validate(data)                                    # raises on bad shape
+            return data
+        except (ValueError, KeyError, TypeError) as e:
+            last_err = e
+    raise ValueError(f"Claude returned unparseable/invalid JSON after retry: {last_err}")
+
+def _validate_match(d):
+    """Shape check for the matching skill output."""
+    fs = d["factor_scores"]
+    for f in JUDGMENT_FACTORS:
+        if "score" not in fs[f]:
+            raise KeyError(f"factor_scores.{f}.score missing")
+    if "triggered" not in d["deal_breakers"]:
+        raise KeyError("deal_breakers.triggered missing")
+    if "overall_assessment" not in d:
+        raise KeyError("overall_assessment missing")
+
+def _validate_resume(d):
+    """Shape check for the resume-tailoring skill output."""
+    tr = d["tailored_resume"]
+    for k in ("headline", "summary", "experience", "skills"):
+        if k not in tr:
+            raise KeyError(f"tailored_resume.{k} missing")
 
 def score_job(job, profile):
     return _call_claude(MODEL_MATCH, MATCHING_SKILL, {
@@ -341,14 +398,14 @@ def score_job(job, profile):
         "client_profile": {k: profile.get(k) for k in
             ("seniority_summary","scope","industries","job_titles","skills")},
         "deal_breakers": profile.get("deal_breakers", []),
-    })
+    }, validate=_validate_match)
 
 def tailor_resume(job, profile, match_evidence, base_resume):
     return _call_claude(MODEL_RESUME, RESUME_SKILL, {
         "current_resume": base_resume,
         "job_description": job["job_description"],
         "matching_evidence": match_evidence,
-    }, max_tokens=4000)
+    }, max_tokens=4000, validate=_validate_resume)
 
 # ============================ DETERMINISTIC SCORING ==========================
 def salary_score(job, profile):
