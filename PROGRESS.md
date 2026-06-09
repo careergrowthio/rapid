@@ -34,6 +34,14 @@ status + "verified" notes as each task moves. Build order follows Handoff §8 (1
 - 🔒 Mesa (00000000-0000-0000-0000-000000000001) is the only client until shadow-running.
 - Spend caps: start minimal (1 Apify query, ≤10 jobs, ≤10 Claude calls). Ask before any run >~$5.
 
+## Live testing
+- ⏳ Secrets were set in environment settings but are NOT present in the current
+  container (env injection happens at container/session creation). **Start a fresh
+  session on this environment** to load them, then run the preflight.
+- `scripts/preflight.py` — read-only credential checker (Anthropic, Supabase, Apify,
+  Postmark; Google deferred). No email, near-zero cost. Run after a fresh session.
+- New sessions need deps: `pip install -r requirements.txt` (container is ephemeral).
+
 ## Notes
 - Offline-testable tasks (3, 4, 7) can proceed without credentials. Tasks needing live
   APIs (1, 2, 5, 6, 9, 10) are blocked until the corresponding secret is provided.
