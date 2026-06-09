@@ -193,6 +193,20 @@ _NON_US_TOKENS = {
     "nigeria","lagos","kenya","nairobi","egypt","cairo","uae","dubai","abu dhabi",
     "qatar","israel","tel aviv","turkey","istanbul","emea","apac","latam",
 }
+_STATE_NAME_TO_ABBR = {
+    "alabama":"al","alaska":"ak","arizona":"az","arkansas":"ar","california":"ca",
+    "colorado":"co","connecticut":"ct","delaware":"de","florida":"fl","georgia":"ga",
+    "hawaii":"hi","idaho":"id","illinois":"il","indiana":"in","iowa":"ia",
+    "kansas":"ks","kentucky":"ky","louisiana":"la","maine":"me","maryland":"md",
+    "massachusetts":"ma","michigan":"mi","minnesota":"mn","mississippi":"ms",
+    "missouri":"mo","montana":"mt","nebraska":"ne","nevada":"nv",
+    "new hampshire":"nh","new jersey":"nj","new mexico":"nm","new york":"ny",
+    "north carolina":"nc","north dakota":"nd","ohio":"oh","oklahoma":"ok",
+    "oregon":"or","pennsylvania":"pa","rhode island":"ri","south carolina":"sc",
+    "south dakota":"sd","tennessee":"tn","texas":"tx","utah":"ut","vermont":"vt",
+    "virginia":"va","washington":"wa","west virginia":"wv","wisconsin":"wi",
+    "wyoming":"wy","district of columbia":"dc",
+}
 
 def _is_us(job):
     """True unless the location clearly names a non-US place. Empty/unknown -> True
@@ -273,6 +287,45 @@ def _parse_salary_max(s):
             vals.append(v)
     return int(round(max(vals))) if vals else None
 
+# --- Location parsing (city/state) for location_score --------------------------
+_LOC_NOISE = {"usa", "us", "united states", "u.s.", "u.s.a", "remote", "anywhere",
+              "hybrid", "onsite", "on-site", "on site", "in-office", "in office"}
+
+def _parse_location(loc):
+    """'Mesa, Arizona' -> ('mesa','az'); 'New York, NY' -> ('new york','ny').
+    Country/remote noise is dropped. Returns (city, state_abbr); either may be None.
+    A 2-letter abbreviation wins over a name match so a city that shares a state's
+    name (e.g. New York) is still read as the city."""
+    if not loc:
+        return (None, None)
+    parts = [re.sub(r'\(.*?\)', '', p).strip().lower() for p in re.split(r'[,/]', str(loc))]
+    parts = [p for p in parts if p and p not in _LOC_NOISE]
+    if not parts:
+        return (None, None)
+    state = state_idx = None
+    for i, p in enumerate(parts):                 # prefer an explicit abbreviation
+        if p in _US_STATE_ABBR:
+            state, state_idx = p, i; break
+    if state is None:                             # else fall back to a full state name
+        for i, p in enumerate(parts):
+            if p in _US_STATE_NAMES:
+                state, state_idx = _STATE_NAME_TO_ABBR[p], i; break
+    city = next((p for i, p in enumerate(parts) if i != state_idx), None)
+    return (city, state)
+
+def _location_band(job_loc, pref_loc):
+    """Coarse distance band between a job and a preferred location (no geocoding):
+    exact city+state -> 100, same state -> 75, same city only -> 80, else US -> 40."""
+    jc, js = job_loc
+    pc, ps = pref_loc
+    if jc and pc and jc == pc and js and ps and js == ps:
+        return 100
+    if js and ps and js == ps:
+        return 75
+    if jc and pc and jc == pc:
+        return 80
+    return 40
+
 # ============================ CLAUDE CALLS ===================================
 def _call_claude(model, skill, payload, max_tokens=1500):
     resp = _get_claude().messages.create(
@@ -307,8 +360,19 @@ def salary_score(job, profile):
     return 20
 
 def location_score(job, profile):
-    ...  # TODO[DEV]: remote match -> 100; else distance bands from preferred_locations
-    return 70
+    """Remote job + remote-accepting client -> 100. Otherwise the best distance band
+    against the client's preferred_locations. Unknown/unlistable location -> 70
+    (lenient default, matching salary_score: missing data never tanks the composite)."""
+    arrangements = {_norm_arrangement(a) for a in (profile.get("work_arrangements") or [])}
+    if _job_arrangement(job) == "remote" and ("remote" in arrangements or not arrangements):
+        return 100
+    job_loc = _parse_location(job.get("location"))
+    if job_loc == (None, None):
+        return 70                              # unparseable location -> lenient
+    prefs = [_parse_location(p) for p in (profile.get("preferred_locations") or [])]
+    if not prefs:
+        return 70                              # no stated preference -> lenient
+    return max(_location_band(job_loc, p) for p in prefs)
 
 def composite(scores, weights):
     total_w = sum(weights.values()) or 1
