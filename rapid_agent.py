@@ -478,18 +478,107 @@ def refresh_base_resume(client):
     ...
 
 # ============================ EMAIL ==========================================
+def _email_location(job):
+    return job.get("location") or ("Remote" if job.get("is_remote") else "")
+
+def render_match_email(client, match, match_count=1):
+    """Render the (subject, html) for one match per rapid_match_email_template.md.
+    Pure + testable. Strong vs Possible differ only in the medal, the tier label on
+    the score line, and the closing line; everything else is identical."""
+    job   = match["job"]
+    name  = (client.get("name") or "").upper()
+    score = int(round(float(match.get("composite_score") or 0)))
+    tier  = match.get("tier")
+    strong = tier == "strong"
+    medal  = "🥇" if strong else "🥈"
+    label  = "STRONG FIT" if strong else "POSSIBLE FIT"
+    why_lead = "Why it matches:" if strong else "Why it's worth a look:"
+    closing = ("Strong fits go fast - apply within 24 hours for best results!"
+               if strong else
+               "This one cleared our 70% quality bar but isn't a slam dunk - you "
+               "decide. Your tailored resume is ready either way.")
+    word = "match" if match_count == 1 else "matches"
+
+    loc = _email_location(job)
+    salary = job.get("salary_range")
+    line2 = loc + (f" | 💰 {salary} PER YEAR" if salary else "")   # omit salary segment when absent
+
+    subject = f"NEW: RAPID JOB MATCH FOR {name}"
+    html = (
+        f"<p>🎯 JOB MATCHES FOR {name} 🎯</p>"
+        f"<p>{medal} <b>{job.get('job_title','')}</b> at {job.get('company','')}<br>"
+        f"{line2}<br>"
+        f"Match Score: {score}% - {label}<br>"
+        f"📄 Tailored Resume: <a href=\"{match.get('resume_url','')}\">View Resume</a><br>"
+        f"<a href=\"{job.get('job_url','')}\">Apply Here</a></p>"
+        f"<p><b>{why_lead}</b> {match.get('match_reason','')}</p>"
+        f"<p>💡 Found {match_count} quality {word} (70%+ fit). {closing}</p>"
+    )
+    return subject, html
+
+def _post_postmark(payload):
+    """POST one message to Postmark. Isolated so tests can stub it (no network)."""
+    import requests
+    token = os.environ["POSTMARK_SERVER_TOKEN"]
+    r = requests.post("https://api.postmarkapp.com/email",
+                      headers={"X-Postmark-Server-Token": token,
+                               "Accept": "application/json",
+                               "Content-Type": "application/json"},
+                      json=payload, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
 def send_match_email(client, match):
-    # TODO[DEV]: Postmark (Transactional stream); render rapid_match_email_template.md
-    #            (Strong/Possible variants). The same 'sent' match row is the
-    #            DASHBOARD feed: the Vercel dashboard shows matches WHERE
-    #            status='sent' (joined to jobs) -- pending/queued never display.
-    ...
+    """Render + send one match email via Postmark (Transactional stream).
+    SAFETY RAIL: in test mode every email goes ONLY to TEST_RECIPIENT_OVERRIDE; we
+    NEVER fall back to the real client address. No override set -> refuse to send."""
+    to = os.environ.get("TEST_RECIPIENT_OVERRIDE")
+    if not to:
+        raise RuntimeError("TEST_RECIPIENT_OVERRIDE not set - refusing to send "
+                           "(test-mode safety rail). No email sent.")
+    subject, html = render_match_email(client, match)
+    sender = os.environ.get("POSTMARK_FROM_ADDRESS", "rapidnotifications@careergrowth.io")
+    return _post_postmark({
+        "From": f"RAPID MATCH <{sender}>",
+        "To": to,
+        "Subject": subject,
+        "HtmlBody": html,
+        "MessageStream": "outbound",       # Postmark Transactional stream
+    })
+
+def render_ops_alert(alerting):
+    """Render (subject, html) for the ops starvation alert listing each ALERT client
+    and its latest funnel WHY. Pure + testable."""
+    n = len(alerting)
+    subject = f"RAPID ALERT: {n} client{'s' if n != 1 else ''} with 0 matches in 5 days"
+    rows = []
+    for c in alerting:
+        why = c.get("latest_funnel")
+        why = json.dumps(why) if not isinstance(why, str) else why
+        rows.append(f"<li><b>{c.get('name','?')}</b> ({c.get('health','')})<br>"
+                    f"<small>limiting gate: {why or 'no funnel logged'}</small></li>")
+    html = (f"<p>{n} active client{'s' if n != 1 else ''} have received 0 emailed "
+            f"matches in 5 days. Each row shows the latest funnel diagnosis (the WHY):</p>"
+            f"<ul>{''.join(rows)}</ul>")
+    return subject, html
 
 def notify_ops(alerting):
-    # TODO[DEV]: Postmark email to the ops/team address listing each ALERT client
-    #            with its latest_funnel WHY (which gate is starving them).
-    #            This is the push half of the 5-day guarantee; the health view is the pull half.
-    ...
+    """Email the ops/team address the list of ALERT clients + their funnel WHY (the
+    push half of the 5-day starvation guarantee). No-op when there's nothing to send."""
+    if not alerting:
+        return None
+    to = os.environ.get("OPS_ALERT_EMAIL")
+    if not to:
+        raise RuntimeError("OPS_ALERT_EMAIL not set - cannot send ops alert.")
+    subject, html = render_ops_alert(alerting)
+    sender = os.environ.get("POSTMARK_FROM_ADDRESS", "rapidnotifications@careergrowth.io")
+    return _post_postmark({
+        "From": f"RAPID OPS <{sender}>",
+        "To": to,
+        "Subject": subject,
+        "HtmlBody": html,
+        "MessageStream": "outbound",
+    })
 
 # ============================ DELIVERY (shared by new + queued) ==============
 def deliver(client, profile, job, comp, tier, scores, reason, evidence, conf, now,
