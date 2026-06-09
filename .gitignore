@@ -20,3 +20,6 @@ venv/
 
 # transient secret-entry file (never commit)
 FILL_THESE_KEYS.txt
+keys.txt
+keys.env
+mykeys.txt
