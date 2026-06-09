@@ -35,12 +35,18 @@ status + "verified" notes as each task moves. Build order follows Handoff §8 (1
 - Spend caps: start minimal (1 Apify query, ≤10 jobs, ≤10 Claude calls). Ask before any run >~$5.
 
 ## Live testing
-- Preflight result (this session): **Anthropic OK** (key valid, model reachable).
-  Supabase / Apify / Postmark returned **403 from the egress proxy even with no auth** —
-  i.e. blocked by the environment's restrictive network policy, NOT bad keys. Those
-  three keys remain UNTESTED until the network opens.
-- DECISION: open **full network access** on the environment, then restart. Network +
-  secret changes only apply to a freshly built session.
+- Preflight result (2026-06-09, open-network session): **ALL FOUR LIVE KEYS OK** via
+  `scripts/preflight.py` (read-only, no email, near-zero cost):
+  - Anthropic — model `claude-haiku-4-5` reachable.
+  - Supabase — `clients` table reachable (count=1, i.e. Mesa only ✓).
+  - Apify — authenticated as `careergrowth`.
+  - Postmark — server 'My First Server' reachable (no email sent).
+  - Google Docs/Drive — SKIPPED (GOOGLE_SERVICE_ACCOUNT_JSON deferred by request).
+- Prior session note (superseded): Supabase/Apify/Postmark had returned 403 from the
+  egress proxy under the restrictive network policy — that was the network, not the keys.
+- Env quirk this session: system `PyJWT`/`cryptography` were Debian-managed and broke the
+  supabase import chain. Fix: `pip install --ignore-installed PyJWT cryptography` before
+  `pip install -r requirements.txt`.
 - `.env` and `.venv` are gitignored, so they do NOT carry into a new session. Next
   session: re-provide keys (re-upload keys.txt OR use env secrets), recreate venv,
   `pip install`, rerun `scripts/preflight.py`.
