@@ -78,30 +78,163 @@ MATCHING_SKILL = load_skill("rapid_matching_skill.md")
 RESUME_SKILL   = load_skill("rapid_resume_tailoring_skill.md")
 
 # ============================ DB — Supabase ==================================
-# TODO[DEV]: wire supabase-py (create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY))
-def get_active_clients():            ...  # clients WHERE status='rapid_active'
-def get_match_profile(client_id):    ...  # match_profiles WHERE client_id=...
-def get_all_active_query_sets():     ...  # deduped union of (title query x preferred_location) over active clients;
-                                          # for clients with search_mode='expanded', ALSO include their expanded_queries
-def get_sent_count_since(client_id, days): ...  # COUNT matches status='sent' in last `days`
-def set_search_mode(client_id, mode):      ...  # UPDATE match_profiles SET search_mode=...
-def upsert_jobs(jobs):               ...  # INSERT INTO jobs ... ON CONFLICT (content_hash) DO NOTHING
+_sb = None
+def _get_sb():
+    """Lazily build the Supabase client (service role) so the module imports without
+    creds. Server-side only; the service key bypasses RLS."""
+    global _sb
+    if _sb is None:
+        from supabase import create_client
+        _sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+    return _sb
+
+def _parse_ts(s):
+    """Postgres timestamptz string -> aware UTC datetime (the code does datetime math
+    on posted_at/scraped_at). Pass through datetimes; None stays None."""
+    if not s:
+        return None
+    if isinstance(s, dt.datetime):
+        return s if s.tzinfo else s.replace(tzinfo=dt.timezone.utc)
+    try:
+        d = dt.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+
+def _normalize_job(j):
+    """Coerce a job row's timestamp columns into aware datetimes."""
+    if j:
+        for k in ("posted_at", "scraped_at"):
+            if k in j:
+                j[k] = _parse_ts(j[k])
+    return j
+
+def get_active_clients():
+    return _get_sb().table("clients").select("*").eq("status", "rapid_active").execute().data
+
+def get_match_profile(client_id):
+    rows = _get_sb().table("match_profiles").select("*").eq("client_id", client_id).limit(1).execute().data
+    return rows[0] if rows else None
+
+def get_all_active_query_sets():
+    """Deduped union of every active client's title_search_queries (+ expanded_queries
+    when search_mode='expanded'). These strings are the provenance tags written to
+    jobs.matched_queries; location is applied in scrape_jobs (Task 2)."""
+    sb = _get_sb()
+    active = sb.table("clients").select("id").eq("status", "rapid_active").execute().data
+    ids = [c["id"] for c in active]
+    if not ids:
+        return []
+    profs = sb.table("match_profiles").select(
+        "title_search_queries, expanded_queries, search_mode").in_("client_id", ids).execute().data
+    out = set()
+    for p in profs:
+        out.update(p.get("title_search_queries") or [])
+        if p.get("search_mode") == "expanded":
+            out.update(p.get("expanded_queries") or [])
+    return sorted(out)
+
+def get_sent_count_since(client_id, days):
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat()
+    res = _get_sb().table("matches").select("id", count="exact").eq("client_id", client_id)\
+        .eq("status", "sent").gte("sent_at", cutoff).execute()
+    return res.count or 0
+
+def set_search_mode(client_id, mode):
+    _get_sb().table("match_profiles").update({"search_mode": mode})\
+        .eq("client_id", client_id).execute()
+
+def upsert_jobs(jobs):
+    """Insert new pool jobs; on content_hash conflict MERGE matched_queries (a job
+    re-found by another client's query gains that tag) rather than overwriting.
+    Read-modify-write per job -- volumes per cycle are small and it needs no DB function."""
+    sb = _get_sb()
+    for job in jobs or []:
+        ch = job.get("content_hash")
+        existing = sb.table("jobs").select("id, matched_queries")\
+            .eq("content_hash", ch).limit(1).execute().data if ch else []
+        if existing:
+            cur = existing[0].get("matched_queries") or []
+            merged = sorted(set(cur) | set(job.get("matched_queries") or []))
+            if merged != sorted(cur):
+                sb.table("jobs").update({"matched_queries": merged})\
+                    .eq("id", existing[0]["id"]).execute()
+        else:
+            sb.table("jobs").insert(job).execute()
+
 def get_pool_jobs_after(since_ts, max_days, client_queries=None):
-    ...  # jobs WHERE scraped_at > since AND posted_at > now()-max_days
-         #      AND matched_queries && client_queries   -- provenance scope IN SQL (cheapest)
-         # since_ts None (client's first run) => ALL pool jobs inside the freshness window
-def get_matched_job_ids(client_id):  ...  # set of job_id already in matches for this client (any status)
-def get_queued_matches(client_id):   ...  # matches WHERE status='queued' ORDER BY composite_score DESC (join jobs for posted_at, title, company, description)
+    """Pool jobs within the freshness window, scoped by provenance. since_ts None
+    (client's first run) => all pool jobs in the window. Unknown posted_at is kept
+    (unknown never kills); the prefilter applies the hard freshness cap."""
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max_days)).isoformat()
+    q = _get_sb().table("jobs").select("*").or_(f"posted_at.gte.{cutoff},posted_at.is.null")
+    if since_ts:
+        q = q.gt("scraped_at", since_ts.isoformat() if isinstance(since_ts, dt.datetime) else since_ts)
+    if client_queries:
+        q = q.overlaps("matched_queries", list(client_queries))
+    return [_normalize_job(j) for j in q.execute().data]
+
+def get_matched_job_ids(client_id):
+    rows = _get_sb().table("matches").select("job_id").eq("client_id", client_id).execute().data
+    return {r["job_id"] for r in rows if r.get("job_id")}
+
+def get_queued_matches(client_id):
+    rows = _get_sb().table("matches").select("*, jobs(*)").eq("client_id", client_id)\
+        .eq("status", "queued").order("composite_score", desc=True).execute().data
+    out = []
+    for r in rows:
+        r["job"] = _normalize_job(r.pop("jobs", None) or {})
+        out.append(r)
+    return out
+
 def recently_sent_similar(client_id, company, title, days):
-    ...  # bool: a 'sent' match for same (company, normalized title) within `days`
-         # guards cross-source duplicates (same role, different board/url/hash)
-def set_last_scored_at(client_id, ts): ...  # UPDATE clients SET last_scored_at=ts
-def todays_sent_count(client_id):    ...  # COUNT matches status='sent' where sent_at::date = today IN CAP_TIMEZONE
-def save_match(match):               ...  # INSERT into matches -> RETURN id
-def update_match(match_id, fields):  ...  # UPDATE matches SET ... WHERE id=...
-def get_last_pool_refresh_at():      ...  # ts of last successful pool refresh (run_log) -> for gap widening
-def get_alerting_clients():          ...  # SELECT * FROM client_health WHERE health LIKE 'ALERT%'
-def log_run(record):                 ...  # INSERT into run_log
+    """True if a 'sent' match for the same (company, normalized title) exists within
+    `days` -- guards cross-source duplicates (same role, different board/url/hash)."""
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat()
+    rows = _get_sb().table("matches").select("id, jobs(company, job_title)")\
+        .eq("client_id", client_id).eq("status", "sent").gte("sent_at", cutoff).execute().data
+    co, ti = (company or "").strip().lower(), (title or "").strip().lower()
+    for r in rows:
+        j = r.get("jobs") or {}
+        if (j.get("company") or "").strip().lower() == co and \
+           (j.get("job_title") or "").strip().lower() == ti:
+            return True
+    return False
+
+def set_last_scored_at(client_id, ts):
+    _get_sb().table("clients").update(
+        {"last_scored_at": ts.isoformat() if isinstance(ts, dt.datetime) else ts})\
+        .eq("id", client_id).execute()
+
+def todays_sent_count(client_id):
+    """Count today's 'sent' matches, where 'today' is the business day in CAP_TIMEZONE
+    (not UTC) -- the 3/day cap is evaluated in business time."""
+    from zoneinfo import ZoneInfo
+    now_local = dt.datetime.now(ZoneInfo(CAP_TIMEZONE))
+    start_utc = now_local.replace(hour=0, minute=0, second=0, microsecond=0)\
+        .astimezone(dt.timezone.utc)
+    res = _get_sb().table("matches").select("id", count="exact").eq("client_id", client_id)\
+        .eq("status", "sent").gte("sent_at", start_utc.isoformat()).execute()
+    return res.count or 0
+
+def save_match(match):
+    return _get_sb().table("matches").insert(match).execute().data[0]["id"]
+
+def update_match(match_id, fields):
+    _get_sb().table("matches").update(fields).eq("id", match_id).execute()
+
+def get_last_pool_refresh_at():
+    """Approximate last successful refresh as the newest scraped_at in the pool (drives
+    the gap-widening scrape window). No new jobs => window simply overlaps a bit more."""
+    rows = _get_sb().table("jobs").select("scraped_at")\
+        .order("scraped_at", desc=True).limit(1).execute().data
+    return _parse_ts(rows[0]["scraped_at"]) if rows else None
+
+def get_alerting_clients():
+    return _get_sb().table("client_health").select("*").like("health", "ALERT%").execute().data
+
+def log_run(record):
+    _get_sb().table("run_log").insert(record).execute()
 
 # ============================ SCRAPE — Apify (Fantastic Jobs + similar) ======
 def content_hash(job):
