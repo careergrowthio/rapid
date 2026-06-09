@@ -35,11 +35,17 @@ status + "verified" notes as each task moves. Build order follows Handoff §8 (1
 - Spend caps: start minimal (1 Apify query, ≤10 jobs, ≤10 Claude calls). Ask before any run >~$5.
 
 ## Live testing
-- ⏳ Secrets were set in environment settings but are NOT present in the current
-  container (env injection happens at container/session creation). **Start a fresh
-  session on this environment** to load them, then run the preflight.
+- Preflight result (this session): **Anthropic OK** (key valid, model reachable).
+  Supabase / Apify / Postmark returned **403 from the egress proxy even with no auth** —
+  i.e. blocked by the environment's restrictive network policy, NOT bad keys. Those
+  three keys remain UNTESTED until the network opens.
+- DECISION: open **full network access** on the environment, then restart. Network +
+  secret changes only apply to a freshly built session.
+- `.env` and `.venv` are gitignored, so they do NOT carry into a new session. Next
+  session: re-provide keys (re-upload keys.txt OR use env secrets), recreate venv,
+  `pip install`, rerun `scripts/preflight.py`.
 - `scripts/preflight.py` — read-only credential checker (Anthropic, Supabase, Apify,
-  Postmark; Google deferred). No email, near-zero cost. Run after a fresh session.
+  Postmark; Google deferred). No email, near-zero cost.
 - New sessions need deps: `pip install -r requirements.txt` (container is ephemeral).
 
 ## Notes
