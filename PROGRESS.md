@@ -18,16 +18,18 @@ status + "verified" notes as each task moves. Build order follows Handoff §8 (1
 ## Dev Scope of Work (Handoff §8)
 | # | Task | Status | Verified |
 |---|------|--------|----------|
-| 1 | Supabase data layer (DB stubs in rapid_agent.py) | ⬜ | needs SUPABASE_URL + SERVICE_KEY |
-| 2 | Apify scrape → shared pool (tag matched_queries; upsert MERGES) | ⬜ | needs APIFY_TOKEN |
-| 3 | Parser helpers (_is_us, _arrangement_compatible, _parse_salary_max) + unit tests | ✅ | 48 tests pass (`python3 -m pytest -q`) |
-| 4 | location_score | ✅ | 66 tests pass total (`python3 -m pytest -q`) |
-| 5 | Google Docs merge (render_resume) + refresh_base_resume | ⬜ | needs GOOGLE_SERVICE_ACCOUNT_JSON + template |
-| 6 | Postmark send + notify_ops | ⬜ | needs POSTMARK_SERVER_TOKEN |
-| 7 | Harden Claude JSON parsing (strip stray text, validate, retry once) | ✅ | 81 tests pass; prompt caching on skill system prompt too |
-| 8 | Bounded concurrency (idempotent, no double-sends) | ⬜ | |
-| 9 | RLS policies | ⬜ | |
-| 10 | Deploy + schedule | ⬜ | |
+| 1 | Supabase data layer (DB stubs in rapid_agent.py) | ✅ | all 17 fns implemented; verified read-only against live Mesa (active client, profile, query sets, counts, pool, health) |
+| 2 | Apify scrape → shared pool (tag matched_queries; upsert MERGES) | 🟡 | code done + 15 unit tests; actor IDs discovered from account (LinkedIn vIGxjRrHqDTPuE6M4, career-site s3dtSTZSZWFtAVLn5). NOT yet run live (needs minimal-spend go-ahead) |
+| 3 | Parser helpers (_is_us, _arrangement_compatible, _parse_salary_max) + unit tests | ✅ | tests pass (`python3 -m pytest -q`) |
+| 4 | location_score | ✅ | tests pass (`python3 -m pytest -q`) |
+| 5 | Google Docs merge (render_resume) + refresh_base_resume | 🔒 | DEFERRED per owner (no GOOGLE_SERVICE_ACCOUNT_JSON). render_resume now raises (no placeholder link can be emailed) |
+| 6 | Postmark send + notify_ops | 🟡 | implemented (HTML render of both variants; hard TEST_RECIPIENT_OVERRIDE). NOT yet sent (needs send go-ahead) |
+| 7 | Harden Claude JSON parsing (strip stray text, validate, retry once) | ✅ | prompt caching on skill system prompt too |
+| 8 | Bounded concurrency (idempotent, no double-sends) | ✅ | ThreadPoolExecutor(RAPID_MAX_WORKERS=5) fan-out; + sql/04 unique (client_id,job_id) index for DB-level idempotency |
+| 9 | RLS policies | 🟡 | sql/05_rls_policies.sql written (default-deny + dashboard sent-only reads). NOT yet applied to live DB |
+| 10 | Deploy + schedule | 🟡 | Dockerfile + docs/DEPLOY.md (Render/Railway hourly cron). NOT yet deployed |
+
+Total tests: **96 pass** (`python3 -m pytest -q`).
 
 ## Safety state
 - 🔒 TEST MODE. Every email sends ONLY to TEST_RECIPIENT_OVERRIDE until shadow-run passes.

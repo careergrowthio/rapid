@@ -30,7 +30,7 @@ Install: pip install anthropic supabase apify-client google-api-python-client
 Model strings: verify current values at https://docs.claude.com/en/api/overview
 """
 
-import os, json, hashlib, re, datetime as dt
+import os, json, hashlib, re, html, datetime as dt
 
 try:                       # load .env if present (no-op when python-dotenv absent)
     from dotenv import load_dotenv
@@ -78,32 +78,214 @@ MATCHING_SKILL = load_skill("rapid_matching_skill.md")
 RESUME_SKILL   = load_skill("rapid_resume_tailoring_skill.md")
 
 # ============================ DB — Supabase ==================================
-# TODO[DEV]: wire supabase-py (create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY))
-def get_active_clients():            ...  # clients WHERE status='rapid_active'
-def get_match_profile(client_id):    ...  # match_profiles WHERE client_id=...
-def get_all_active_query_sets():     ...  # deduped union of (title query x preferred_location) over active clients;
-                                          # for clients with search_mode='expanded', ALSO include their expanded_queries
-def get_sent_count_since(client_id, days): ...  # COUNT matches status='sent' in last `days`
-def set_search_mode(client_id, mode):      ...  # UPDATE match_profiles SET search_mode=...
-def upsert_jobs(jobs):               ...  # INSERT INTO jobs ... ON CONFLICT (content_hash) DO NOTHING
+# Single datastore. We use the SERVICE ROLE key (bypasses RLS) -- server-side only,
+# never shipped to the dashboard. The client is lazily constructed so the module
+# imports (and the pure helpers stay unit-testable) without the SDK or a key.
+_sb = None
+def _get_sb():
+    global _sb
+    if _sb is None:
+        from supabase import create_client
+        _sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+    return _sb
+
+def _parse_ts(v):
+    """Coerce a Supabase/ISO timestamp into a tz-aware datetime (UTC if naive).
+    Pass-through for None / already-datetime. Unparseable -> None."""
+    if v is None or isinstance(v, dt.datetime):
+        return v
+    s = str(v).strip().replace("Z", "+00:00")
+    try:
+        d = dt.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return d.replace(tzinfo=dt.timezone.utc) if d.tzinfo is None else d
+
+def _iso(ts):
+    return ts.isoformat() if isinstance(ts, dt.datetime) else ts
+
+def _hydrate_job(row):
+    """DB row -> in-memory job dict with timestamp columns parsed to datetimes,
+    so downstream freshness math (now - posted_at) works the same as on scrape."""
+    if not row:
+        return row
+    row = dict(row)
+    for k in ("posted_at", "scraped_at"):
+        if k in row:
+            row[k] = _parse_ts(row[k])
+    return row
+
+def _norm_title(s):
+    """Normalize a job title for cross-source dedup: lowercase, strip punctuation,
+    collapse whitespace. 'Sr. VP, Sales' -> 'sr vp sales'."""
+    return re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9 ]', ' ', (s or '').lower())).strip()
+
+def get_active_clients():
+    res = _get_sb().table("clients").select("*").eq("status", "rapid_active").execute()
+    return res.data or []
+
+def get_match_profile(client_id):
+    res = _get_sb().table("match_profiles").select("*").eq("client_id", client_id).limit(1).execute()
+    return (res.data or [None])[0]
+
+def get_all_active_query_sets():
+    """Deduped union of every active client's title queries x preferred locations x
+    work arrangements, shaped for the Fantastic Jobs actors (titleSearch/locationSearch
+    arrays). Clients in search_mode='expanded' also contribute their expanded_queries.
+    Provenance is re-derived per job from titleSearch (see _query_matches_title), so a
+    single shared scrape keeps each client scoped to jobs their own queries found."""
+    clients = get_active_clients()
+    ids = [c["id"] for c in clients]
+    empty = {"titleSearch": [], "locationSearch": [], "workArrangements": []}
+    if not ids:
+        return empty
+    res = (_get_sb().table("match_profiles")
+           .select("title_search_queries,expanded_queries,search_mode,preferred_locations,work_arrangements")
+           .in_("client_id", ids).execute())
+    titles, locs, arr = set(), set(), set()
+    for p in res.data or []:
+        titles.update(p.get("title_search_queries") or [])
+        if p.get("search_mode") == "expanded":
+            titles.update(p.get("expanded_queries") or [])
+        locs.update(p.get("preferred_locations") or [])
+        arr.update(p.get("work_arrangements") or [])
+    return {"titleSearch": sorted(titles), "locationSearch": sorted(locs),
+            "workArrangements": sorted(arr)}
+
+def get_sent_count_since(client_id, days):
+    since = _iso(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days))
+    res = (_get_sb().table("matches").select("id", count="exact")
+           .eq("client_id", client_id).eq("status", "sent").gte("sent_at", since).execute())
+    return res.count or 0
+
+def set_search_mode(client_id, mode):
+    _get_sb().table("match_profiles").update({"search_mode": mode}).eq("client_id", client_id).execute()
+
+def upsert_jobs(jobs):
+    """Insert normalized jobs into the shared pool. ON CONFLICT(content_hash) MERGES
+    matched_queries (a job re-found by another client's query gains the tag) -- this
+    provenance merge is what keeps Claude cost flat per client at 100+ clients.
+    scraped_at is left untouched on conflict, so a re-found job is NOT re-surfaced."""
+    if not jobs:
+        return 0
+    sb = _get_sb()
+    by_hash = {}                                   # dedup within this batch first
+    for j in jobs:
+        h = j.get("content_hash")
+        if not h:
+            continue
+        if h in by_hash:
+            by_hash[h]["matched_queries"] = sorted(
+                set(by_hash[h].get("matched_queries") or []) | set(j.get("matched_queries") or []))
+        else:
+            by_hash[h] = dict(j)
+    hashes = list(by_hash)
+    existing = {}                                  # then merge tags with what's already in the pool
+    for i in range(0, len(hashes), 200):
+        chunk = hashes[i:i + 200]
+        res = sb.table("jobs").select("content_hash,matched_queries").in_("content_hash", chunk).execute()
+        for r in res.data or []:
+            existing[r["content_hash"]] = r.get("matched_queries") or []
+    rows = []
+    for h, j in by_hash.items():
+        j["matched_queries"] = sorted(set(j.get("matched_queries") or []) | set(existing.get(h, [])))
+        rows.append(j)
+    sb.table("jobs").upsert(rows, on_conflict="content_hash").execute()
+    return len(rows)
+
 def get_pool_jobs_after(since_ts, max_days, client_queries=None):
-    ...  # jobs WHERE scraped_at > since AND posted_at > now()-max_days
-         #      AND matched_queries && client_queries   -- provenance scope IN SQL (cheapest)
-         # since_ts None (client's first run) => ALL pool jobs inside the freshness window
-def get_matched_job_ids(client_id):  ...  # set of job_id already in matches for this client (any status)
-def get_queued_matches(client_id):   ...  # matches WHERE status='queued' ORDER BY composite_score DESC (join jobs for posted_at, title, company, description)
+    """Pool jobs inside the freshness window, scraped since this client's cursor,
+    scoped to the client's queries IN SQL (matched_queries && client_queries -- the
+    cheapest place to do provenance). since_ts None (client's first run) => the whole
+    freshness window."""
+    sb = _get_sb()
+    posted_floor = _iso(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max_days))
+    q = sb.table("jobs").select("*").gte("posted_at", posted_floor)
+    if since_ts is not None:
+        q = q.gt("scraped_at", _iso(since_ts))
+    if client_queries:
+        q = q.overlaps("matched_queries", list(client_queries))
+    res = q.order("posted_at", desc=True).execute()
+    return [_hydrate_job(r) for r in (res.data or [])]
+
+def get_matched_job_ids(client_id):
+    res = _get_sb().table("matches").select("job_id").eq("client_id", client_id).execute()
+    return {r["job_id"] for r in (res.data or [])}
+
+def get_queued_matches(client_id):
+    res = (_get_sb().table("matches").select("*, job:jobs(*)")
+           .eq("client_id", client_id).eq("status", "queued")
+           .order("composite_score", desc=True).execute())
+    out = []
+    for r in res.data or []:
+        r = dict(r)
+        r["job"] = _hydrate_job(r.get("job") or {})
+        out.append(r)
+    return out
+
 def recently_sent_similar(client_id, company, title, days):
-    ...  # bool: a 'sent' match for same (company, normalized title) within `days`
-         # guards cross-source duplicates (same role, different board/url/hash)
-def set_last_scored_at(client_id, ts): ...  # UPDATE clients SET last_scored_at=ts
-def todays_sent_count(client_id):    ...  # COUNT matches status='sent' where sent_at::date = today IN CAP_TIMEZONE
-def save_match(match):               ...  # INSERT into matches -> RETURN id
-def update_match(match_id, fields):  ...  # UPDATE matches SET ... WHERE id=...
-def get_last_pool_refresh_at():      ...  # ts of last successful pool refresh (run_log) -> for gap widening
-def get_alerting_clients():          ...  # SELECT * FROM client_health WHERE health LIKE 'ALERT%'
-def log_run(record):                 ...  # INSERT into run_log
+    """True if a 'sent' match exists for the same (company, normalized title) within
+    `days` -- guards cross-source duplicates (same role, different board/url/hash)."""
+    since = _iso(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days))
+    res = (_get_sb().table("matches").select("id, job:jobs(company,job_title)")
+           .eq("client_id", client_id).eq("status", "sent").gte("sent_at", since).execute())
+    nt, nc = _norm_title(title), (company or "").strip().lower()
+    for r in res.data or []:
+        j = r.get("job") or {}
+        if (j.get("company") or "").strip().lower() == nc and _norm_title(j.get("job_title")) == nt:
+            return True
+    return False
+
+def set_last_scored_at(client_id, ts):
+    _get_sb().table("clients").update({"last_scored_at": _iso(ts)}).eq("id", client_id).execute()
+
+def todays_sent_count(client_id):
+    """Count of emails sent to this client 'today' in CAP_TIMEZONE (business TZ, not
+    UTC). Phoenix has no DST, so a fixed local midnight -> UTC bound is exact."""
+    from zoneinfo import ZoneInfo
+    now_local = dt.datetime.now(ZoneInfo(CAP_TIMEZONE))
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = _iso(start_local.astimezone(dt.timezone.utc))
+    res = (_get_sb().table("matches").select("id", count="exact")
+           .eq("client_id", client_id).eq("status", "sent").gte("sent_at", start_utc).execute())
+    return res.count or 0
+
+def save_match(match):
+    res = _get_sb().table("matches").insert(match).execute()
+    return res.data[0]["id"]
+
+def update_match(match_id, fields):
+    _get_sb().table("matches").update(fields).eq("id", match_id).execute()
+
+def get_last_pool_refresh_at():
+    """Timestamp of the last successful shared-pool refresh. Pool refreshes are logged
+    to run_log with a NULL client_id (the only client-less rows), so we read the most
+    recent of those -> drives the self-widening scrape window."""
+    res = (_get_sb().table("run_log").select("run_finished_at")
+           .is_("client_id", "null").not_.is_("run_finished_at", "null")
+           .order("run_finished_at", desc=True).limit(1).execute())
+    rows = res.data or []
+    return _parse_ts(rows[0]["run_finished_at"]) if rows else None
+
+def get_alerting_clients():
+    res = _get_sb().table("client_health").select("*").like("health", "ALERT%").execute()
+    return res.data or []
+
+def log_run(record):
+    rec = dict(record)
+    rec.setdefault("run_finished_at", _iso(dt.datetime.now(dt.timezone.utc)))
+    _get_sb().table("run_log").insert(rec).execute()
 
 # ============================ SCRAPE — Apify (Fantastic Jobs + similar) ======
+# The two Fantastic Jobs actors this account already uses (discovered from prior
+# runs). Both take the same input: titleSearch[] (Boolean ":*" prefix queries),
+# locationSearch[] ("City, State"), timeRange ("Nh"/"Nd"), limit, includeAi.
+APIFY_ACTOR_LINKEDIN = "vIGxjRrHqDTPuE6M4"   # fantastic-jobs/advanced-linkedin-job-search-api
+APIFY_ACTOR_CAREER   = "s3dtSTZSZWFtAVLn5"   # fantastic-jobs/career-site-job-listing-api (ATS/greenhouse/etc.)
+# SAFETY: cap results per actor run. Override with RAPID_SCRAPE_LIMIT (keep tiny for
+# first integration runs per the spend rails); raise once a full pass works.
+SCRAPE_LIMIT_DEFAULT = 50
+
 def content_hash(job):
     return hashlib.sha256(f"{job['job_url']}|{job['job_title']}|{job['company']}".encode()).hexdigest()
 
@@ -122,20 +304,119 @@ def refresh_job_pool():
     hours = min(max(gap_h, MIN_SCRAPE_HOURS), FRESHNESS_MAX_DAYS * 24)
     query_sets = get_all_active_query_sets()
     jobs = scrape_jobs(query_sets, hours)         # normalized job dicts + content_hash each
-    upsert_jobs(jobs)                             # ON CONFLICT (content_hash) DO NOTHING
+    n = upsert_jobs(jobs)                          # ON CONFLICT (content_hash) MERGE matched_queries
+    # mark this refresh (NULL client_id) so the next cycle widens its window from here
+    log_run({"client_id": None, "jobs_scraped": len(jobs), "jobs_after_filter": n,
+             "run_finished_at": _iso(dt.datetime.now(dt.timezone.utc))})
+    return n
 
-def scrape_jobs(query_sets, lookback_hours):
-    """Call the Apify Fantastic Jobs actors (and similar) for each query in the
-    deduped union, with a lookback_hours window. Return normalized job dicts:
-    {source, external_job_id, job_title, company, location, is_remote,
-     salary_range, job_url, job_description, posted_at, content_hash,
-     matched_queries: [the query string(s) that found it]}."""
-    # TODO[DEV]: apify-client; reuse the existing actor IDs + Boolean queries.
-    #            Gate pricier sources (Indeed/Glassdoor) to run infrequently.
-    #            TAG each job with the query that found it (provenance) and make
-    #            upsert_jobs MERGE matched_queries on conflict -- this scoping is
-    #            what keeps Claude cost flat per client at 100+ clients.
-    return []
+def _timerange(hours):
+    """Map an integer lookback to the actor's timeRange string ('Nh' up to a day,
+    else 'Nd' capped at the freshness window)."""
+    hours = int(max(hours, 1))
+    if hours <= 24:
+        return f"{hours}h"
+    return f"{min((hours + 23) // 24, FRESHNESS_MAX_DAYS)}d"
+
+def _query_matches_title(query, title):
+    """Re-derive provenance: does this Boolean ":*" query match the job title?
+    'Senior:* Vice:* President:*' = title has words prefixed by senior AND vice AND
+    president (AND of prefix terms -- the Fantastic Jobs ":*" semantics)."""
+    if not query or not title:
+        return False
+    tokens = [re.sub(r'[^a-z0-9]', '', (t[:-2] if t.endswith(":*") else t).lower())
+              for t in str(query).split()]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return False
+    words = re.findall(r'[a-z0-9]+', str(title).lower())
+    return all(any(w.startswith(tok) for w in words) for tok in tokens)
+
+def _salary_str(item):
+    """Build a human salary string from the actor's structured fields. Treats 0 /
+    null as 'no salary' (some sources emit value:0). Returns None when truly absent
+    -- the lenient salary parser then never filters on it."""
+    raw = item.get("salary_raw")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    lo, hi, val = (item.get("ai_salary_min_value"), item.get("ai_salary_max_value"),
+                   item.get("ai_salary_value"))
+    unit = (item.get("ai_salary_unit_text") or "YEAR").lower()
+    per = {"year": "per year", "hour": "per hour", "month": "per month",
+           "day": "per day", "week": "per week"}.get(unit, "per " + unit)
+    nums = [n for n in (lo, hi) if isinstance(n, (int, float)) and n > 0]
+    fmt = lambda n: f"${int(n):,}"
+    if len(nums) == 2 and nums[0] != nums[1]:
+        return f"{fmt(min(nums))} to {fmt(max(nums))} {per}"
+    if isinstance(val, (int, float)) and val > 0:
+        return f"{fmt(val)} {per}"
+    if nums:
+        return f"{fmt(nums[0])} {per}"
+    return None
+
+def _normalize_job(item, union_titles):
+    """Fantastic Jobs dataset item -> normalized pool dict (jobs-table columns +
+    matched_queries). Drops items missing the dedup keys (title/url/company)."""
+    title, url, org = item.get("title"), item.get("url"), item.get("organization")
+    if not (title and url and org):
+        return None
+    loc = None
+    ld = item.get("locations_derived")
+    if isinstance(ld, list) and ld:
+        loc = ld[0]
+    wa = (item.get("ai_work_arrangement") or "").lower()
+    is_remote = True if (item.get("location_type") == "TELECOMMUTE" or "remote" in wa) else None
+    posted = _parse_ts(item.get("date_posted"))
+    job = {
+        "source": "fantastic_" + (item.get("source") or "unknown"),
+        "external_job_id": str(item.get("id") or "") or None,
+        "job_title": title,
+        "company": org,
+        "location": loc,
+        "is_remote": is_remote,
+        "salary_range": _salary_str(item),
+        "job_url": url,
+        "job_description": item.get("description_text"),
+        "posted_at": _iso(posted),
+        "matched_queries": [q for q in union_titles if _query_matches_title(q, title)],
+    }
+    job["content_hash"] = content_hash(job)
+    return job
+
+def scrape_jobs(query_sets, lookback_hours, limit=None):
+    """Call the Fantastic Jobs actors ONCE over the deduped union of title queries x
+    locations, with a lookback window. Return normalized job dicts:
+    {source, external_job_id, job_title, company, location, is_remote, salary_range,
+     job_url, job_description, posted_at, content_hash, matched_queries}.
+    Work-arrangement is intentionally NOT filtered here (unknown never kills -- the
+    lenient code prefilter handles it). Each job is tagged with the union queries it
+    matches (provenance); upsert_jobs MERGES those tags on conflict."""
+    titles = query_sets.get("titleSearch") or []
+    locs = query_sets.get("locationSearch") or []
+    if not titles:
+        return []
+    if limit is None:
+        limit = int(os.environ.get("RAPID_SCRAPE_LIMIT", SCRAPE_LIMIT_DEFAULT))
+    run_input = {
+        "titleSearch": titles,
+        "locationSearch": locs,
+        "timeRange": _timerange(lookback_hours),
+        "includeAi": True,
+        "descriptionType": "text",
+        "limit": limit,
+    }
+    from apify_client import ApifyClient
+    client = ApifyClient(os.environ["APIFY_TOKEN"])
+    jobs = []
+    for aid in (APIFY_ACTOR_LINKEDIN, APIFY_ACTOR_CAREER):
+        run = client.actor(aid).call(run_input=run_input)
+        if not run or not run.get("defaultDatasetId"):
+            continue
+        for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+            nj = _normalize_job(item, titles)
+            if nj:
+                jobs.append(nj)
+    return jobs
 
 # ============================ PRE-FILTER (cheap, pre-Claude) =================
 # RULE (coverage-critical): UNKNOWN NEVER KILLS. A job is filtered only on a
@@ -461,14 +742,22 @@ def tier_of(comp, profile):
 
 # ============================ RESUME RENDER (Google Docs template) ===========
 def render_resume(tailored_content, client):
-    # TODO[DEV]: copy the GLOBAL template Doc (RESUME_TEMPLATE_DOC_ID) and fill its
-    # {{placeholders}} from tailored_content (which already carries all the client's
-    # facts, sourced from base_resume). Do NOT copy the client's master at render
-    # time -- the master's content lives in clients.base_resume already.
+    # TODO[DEV] (Task 5 -- the one remaining BLOCKED task): copy the GLOBAL template
+    # Doc (RESUME_TEMPLATE_DOC_ID) and fill its {{placeholders}} from tailored_content
+    # (which already carries all the client's facts, sourced from base_resume). Do NOT
+    # copy the client's master at render time -- the master's content lives in
+    # clients.base_resume already.
     # NOTE: the template holds ONE experience block with 3 {{BULLET_n}} lines --
     # duplicate the block per experience entry and per bullet (variable counts),
     # and remove empty sections (e.g. no certifications) rather than leaving headings.
-    return "https://docs.google.com/document/d/PLACEHOLDER"
+    #
+    # Blocked on GOOGLE_SERVICE_ACCOUNT_JSON (deferred). Fail LOUDLY rather than email a
+    # placeholder resume link: run_for_client catches this per-client and leaves a
+    # 'pending' row (alertable), never a phantom 'sent' with a dead link.
+    if not os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        raise NotImplementedError(
+            "render_resume blocked: set GOOGLE_SERVICE_ACCOUNT_JSON to enable Google Docs rendering")
+    raise NotImplementedError("render_resume: Google Docs merge not yet implemented (Task 5)")
 
 def refresh_base_resume(client):
     # TODO[DEV]: read the client's master resume from Drive ONCE (on activation / when the
@@ -478,18 +767,95 @@ def refresh_base_resume(client):
     ...
 
 # ============================ EMAIL ==========================================
+POSTMARK_URL = "https://api.postmarkapp.com/email"
+
+def _postmark_send(to, subject, html_body):
+    """Low-level Postmark Transactional send. Returns the parsed response."""
+    import requests
+    frm = os.environ.get("POSTMARK_FROM_ADDRESS", "rapidnotifications@careergrowth.io")
+    r = requests.post(POSTMARK_URL,
+        headers={"X-Postmark-Server-Token": os.environ["POSTMARK_SERVER_TOKEN"],
+                 "Accept": "application/json", "Content-Type": "application/json"},
+        json={"From": frm, "To": to, "Subject": subject, "HtmlBody": html_body,
+              "MessageStream": "outbound"}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def _render_match_email(client, match):
+    """Render rapid_match_email_template.md (Strong/Possible variants) to (subject,
+    html). The 🥇/🥈 medal, the tier label, and the closing line are the only
+    differences between variants; the salary line is omitted when absent (never 'null')."""
+    job = match.get("job") or {}
+    strong = match.get("tier") == "strong"
+    e = html.escape
+    name = (client.get("name") or "").strip()
+    title = e(job.get("job_title") or "")
+    company = e(job.get("company") or "")
+    location = e(job.get("location") or ("Remote" if job.get("is_remote") else ""))
+    salary = job.get("salary_range")
+    score = match.get("composite_score")
+    resume = e(match.get("resume_url") or "")
+    apply_url = e(job.get("job_url") or "")
+    why = e(match.get("match_reason") or "")
+    n = match.get("match_count", 1)
+    word = "match" if n == 1 else "matches"
+    medal = "🥇" if strong else "🥈"
+    label = "STRONG FIT" if strong else "POSSIBLE FIT"
+    why_label = "Why it matches:" if strong else "Why it's worth a look:"
+    closing = (f"💡 Found {n} quality {word} (70%+ fit). Strong fits go fast — apply "
+               "within 24 hours for best results!" if strong else
+               "💡 This one cleared our 70% quality bar but isn't a slam dunk — you "
+               "decide. Your tailored resume is ready either way.")
+    if salary:
+        loc_line = f"{location} | 💰 {e(salary)} PER YEAR<br>"
+    elif location:
+        loc_line = f"{location}<br>"
+    else:
+        loc_line = ""
+    subject = f"NEW: RAPID JOB MATCH FOR {name.upper()}"
+    body = (
+        '<html><body style="font-family:Arial,Helvetica,sans-serif;color:#222;line-height:1.5;">'
+        f"<p>🎯 JOB MATCHES FOR {e(name).upper()} 🎯</p>"
+        f"<p>{medal} <strong>{title}</strong> at {company}<br>"
+        f"{loc_line}Match Score: {score}% — {label}<br>"
+        f'📄 Tailored Resume: <a href="{resume}">View Resume</a><br>'
+        f'<a href="{apply_url}">Apply Here</a></p>'
+        f"<p><strong>{why_label}</strong> {why}</p>"
+        f"<p>{closing}</p>"
+        "</body></html>")
+    return subject, body
+
 def send_match_email(client, match):
-    # TODO[DEV]: Postmark (Transactional stream); render rapid_match_email_template.md
-    #            (Strong/Possible variants). The same 'sent' match row is the
-    #            DASHBOARD feed: the Vercel dashboard shows matches WHERE
-    #            status='sent' (joined to jobs) -- pending/queued never display.
-    ...
+    """Send one match email via Postmark. The same 'sent' match row is the DASHBOARD
+    feed (Vercel shows matches WHERE status='sent' joined to jobs).
+    SAFETY RAIL: in test mode every email goes ONLY to TEST_RECIPIENT_OVERRIDE, never
+    to a real client address. We refuse to send if that override is unset."""
+    to = os.environ.get("TEST_RECIPIENT_OVERRIDE")          # hard override until shadow-run
+    if not to:
+        raise RuntimeError("TEST_RECIPIENT_OVERRIDE unset; refusing to send (test-mode safety rail)")
+    subject, body = _render_match_email(client, match)
+    return _postmark_send(to, subject, body)
 
 def notify_ops(alerting):
-    # TODO[DEV]: Postmark email to the ops/team address listing each ALERT client
-    #            with its latest_funnel WHY (which gate is starving them).
-    #            This is the push half of the 5-day guarantee; the health view is the pull half.
-    ...
+    """Push half of the 5-day coverage guarantee: email the ops address listing each
+    ALERT client and its latest_funnel WHY (the limiting gate). The health view is the
+    pull half. No-op when nothing is alerting."""
+    if not alerting:
+        return
+    to = os.environ.get("OPS_ALERT_EMAIL") or os.environ.get("TEST_RECIPIENT_OVERRIDE")
+    if not to:
+        return
+    e = html.escape
+    items = []
+    for a in alerting:
+        funnel = e(json.dumps(a.get("latest_funnel"))[:600])
+        items.append(f"<li><strong>{e(str(a.get('name')))}</strong>: "
+                     f"{e(str(a.get('health')))}<br><code>{funnel}</code></li>")
+    body = ("<html><body style=\"font-family:Arial,Helvetica,sans-serif;color:#222;\">"
+            f"<p>RAPID coverage alert — {len(alerting)} client(s) with 0 emailed "
+            f"matches in 5 days. Limiting gate per client (from run_log.funnel):</p>"
+            f"<ul>{''.join(items)}</ul></body></html>")
+    return _postmark_send(to, f"RAPID ALERT: {len(alerting)} starved client(s) need attention", body)
 
 # ============================ DELIVERY (shared by new + queued) ==============
 def deliver(client, profile, job, comp, tier, scores, reason, evidence, conf, now,
@@ -632,20 +998,34 @@ def run_for_client(client):
              "sent_count": len(to_send), "funnel": funnel,
              "run_finished_at": now.isoformat()})
 
+# How many clients to process in parallel. Each client is independent (its own
+# client_id, cursor, and matches), so the only shared work -- the scrape -- runs once
+# up front, before the fan-out. Bounded so the hourly cycle stays inside the hour at
+# 100+ clients without hammering Supabase/Anthropic. Override with RAPID_MAX_WORKERS.
+MAX_WORKERS = int(os.environ.get("RAPID_MAX_WORKERS", "5"))
+
+def _run_client_safe(client):
+    """Per-client entry point for the pool: errors are logged, never fatal to the run."""
+    try:
+        run_for_client(client)
+    except Exception as e:
+        log_run({"client_id": client.get("id"), "error": str(e)})
+
 def main():
-    refresh_job_pool()                      # ONE shared scrape for everyone
-    for client in get_active_clients():
-        try:
-            run_for_client(client)
-        except Exception as e:
-            log_run({"client_id": client.get("id"), "error": str(e)})
+    refresh_job_pool()                      # ONE shared scrape for everyone, before fan-out
+    clients = get_active_clients()
+    # Bounded concurrency across clients to hit the hourly SLA. No double-sends:
+    # clients are disjoint, and within a client the matched_ids guard + crash-safe
+    # 'pending'->send->'sent' ordering keep delivery idempotent.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max(MAX_WORKERS, 1)) as pool:
+        list(pool.map(_run_client_safe, clients))
     alerting = get_alerting_clients()       # 5-day starvation: push the WHY to the team
     if alerting:
         notify_ops(alerting)
-    # TODO[DEV]: bound concurrency across clients to hit the hourly SLA
-    # TODO[DEV]: trigger mechanism -- pg_cron alone can't run this container.
-    #            Either pg_cron + pg_net HTTP call to a container webhook, or the
-    #            host platform's scheduler (Railway/Render cron). Pick one.
+    # Trigger/scheduling: pg_cron alone can't run this container. Deploy on a host
+    # with a scheduler (Railway/Render cron) hitting `main()` hourly -- see
+    # docs/DEPLOY.md and Dockerfile. (Task 10.)
 
 if __name__ == "__main__":
     main()
