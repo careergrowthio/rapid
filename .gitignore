@@ -17,3 +17,6 @@ venv/
 # OS / editor
 .DS_Store
 *.swp
+
+# transient secret-entry file (never commit)
+FILL_THESE_KEYS.txt
