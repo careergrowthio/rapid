@@ -19,7 +19,7 @@ status + "verified" notes as each task moves. Build order follows Handoff §8 (1
 | # | Task | Status | Verified |
 |---|------|--------|----------|
 | 1 | Supabase data layer (DB stubs in rapid_agent.py) | ✅ | all 17 fns implemented; verified read-only against live Mesa (active client, profile, query sets, counts, pool, health) |
-| 2 | Apify scrape → shared pool (tag matched_queries; upsert MERGES) | 🟡 | code done + 15 unit tests; actor IDs discovered from account (LinkedIn vIGxjRrHqDTPuE6M4, career-site s3dtSTZSZWFtAVLn5). NOT yet run live (needs minimal-spend go-ahead) |
+| 2 | Apify scrape → shared pool (tag matched_queries; upsert MERGES) | ✅ | validated LIVE end-to-end: scrape→normalize→upsert(idempotent)→scoped read→prefilter→Claude score. Actors: LinkedIn vIGxjRrHqDTPuE6M4, career-site s3dtSTZSZWFtAVLn5 |
 | 3 | Parser helpers (_is_us, _arrangement_compatible, _parse_salary_max) + unit tests | ✅ | tests pass (`python3 -m pytest -q`) |
 | 4 | location_score | ✅ | tests pass (`python3 -m pytest -q`) |
 | 5 | Google Docs merge (render_resume) + refresh_base_resume | 🔒 | DEFERRED per owner (no GOOGLE_SERVICE_ACCOUNT_JSON). render_resume now raises (no placeholder link can be emailed) |
@@ -37,6 +37,27 @@ Total tests: **96 pass** (`python3 -m pytest -q`).
 - Spend caps: start minimal (1 Apify query, ≤10 jobs, ≤10 Claude calls). Ask before any run >~$5.
 
 ## Live testing
+- **Minimal Apify scrape validated end-to-end (2026-06-09).** One LinkedIn actor run,
+  limit=10, Mesa's 34 title queries. Path proven: scrape → `_normalize_job` →
+  `upsert_jobs` (10 new, then 0 on re-run = idempotent) → `get_pool_jobs_after`
+  (scoped to Mesa queries) → `prefilter` (killed 5 non-US jobs BEFORE any Claude call —
+  cost control works) → `score_job` (Claude). CPG roles scored highest (industry 95,
+  skills 88, salary 100). Mesa correctly yields 0 matches = acceptance gate #1.
+- **3 real bugs found + fixed via live testing:**
+  1. `apify-client` 2.20 returns a pydantic `Run` (not a dict) → added `_run_dataset_id`.
+  2. Live `jobs` table has NO unique constraint on content_hash (migration 02 not fully
+     applied) → rewrote `upsert_jobs` as select-then-insert/merge (no ON CONFLICT dep).
+  3. DB-hydrated jobs carry `datetime` → `_call_claude` now `json.dumps(..., default=str)`.
+- **Deal-breaker engine verified CORRECT:** a "remote"-flagged Tropicana NAM role was
+  knocked out because the JD body said "must be located in Cincinnati/Charlotte or
+  willing to relocate." Skill read the description and cited it verbatim. Deep reading
+  beats the surface remote flag — working as designed.
+- **2 findings to decide on (not blocking):**
+  - (a) For REMOTE-only clients, scraping with `locationSearch=[home city]` returns ~0
+    (Mesa, AZ → 0 jobs); titles-only returned 10. Remote clients likely need national
+    search, not home-city filtering. Design question for `get_all_active_query_sets`.
+  - (b) Consider applying a unique index on `jobs(content_hash)` (additive) to harden
+    dedup; the code no longer requires it but it's good hygiene.
 - Preflight result (2026-06-09, open-network session): **ALL FOUR LIVE KEYS OK** via
   `scripts/preflight.py` (read-only, no email, near-zero cost):
   - Anthropic — model `claude-haiku-4-5` reachable.

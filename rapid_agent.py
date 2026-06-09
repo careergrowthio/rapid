@@ -162,10 +162,15 @@ def set_search_mode(client_id, mode):
     _get_sb().table("match_profiles").update({"search_mode": mode}).eq("client_id", client_id).execute()
 
 def upsert_jobs(jobs):
-    """Insert normalized jobs into the shared pool. ON CONFLICT(content_hash) MERGES
-    matched_queries (a job re-found by another client's query gains the tag) -- this
-    provenance merge is what keeps Claude cost flat per client at 100+ clients.
-    scraped_at is left untouched on conflict, so a re-found job is NOT re-surfaced."""
+    """Insert normalized jobs into the shared pool with global dedup on content_hash.
+    A job already in the pool is NOT re-inserted (so scraped_at is preserved and it is
+    never re-surfaced); instead its matched_queries are MERGED with the new tags (a job
+    re-found by another client's query gains the tag) -- this provenance merge is what
+    keeps Claude cost flat per client at 100+ clients. Returns the count of NEW jobs.
+
+    Implemented as select-then-insert/merge rather than ON CONFLICT so it works whether
+    or not a unique index on content_hash exists in the DB; the once-per-cycle refresh
+    is single-threaded, so there is no concurrent-insert race to guard against."""
     if not jobs:
         return 0
     sb = _get_sb()
@@ -180,18 +185,23 @@ def upsert_jobs(jobs):
         else:
             by_hash[h] = dict(j)
     hashes = list(by_hash)
-    existing = {}                                  # then merge tags with what's already in the pool
+    existing = {}                                  # what's already in the pool (hash -> tags)
     for i in range(0, len(hashes), 200):
         chunk = hashes[i:i + 200]
         res = sb.table("jobs").select("content_hash,matched_queries").in_("content_hash", chunk).execute()
-        for r in res.data or []:
-            existing[r["content_hash"]] = r.get("matched_queries") or []
-    rows = []
+        for row in res.data or []:
+            existing[row["content_hash"]] = row.get("matched_queries") or []
+    new_rows = []
     for h, j in by_hash.items():
-        j["matched_queries"] = sorted(set(j.get("matched_queries") or []) | set(existing.get(h, [])))
-        rows.append(j)
-    sb.table("jobs").upsert(rows, on_conflict="content_hash").execute()
-    return len(rows)
+        if h in existing:                          # re-found: merge tags only, don't re-insert
+            merged = sorted(set(j.get("matched_queries") or []) | set(existing[h]))
+            if merged != sorted(existing[h]):
+                sb.table("jobs").update({"matched_queries": merged}).eq("content_hash", h).execute()
+        else:
+            new_rows.append(j)
+    if new_rows:
+        sb.table("jobs").insert(new_rows).execute()
+    return len(new_rows)
 
 def get_pool_jobs_after(since_ts, max_days, client_queries=None):
     """Pool jobs inside the freshness window, scraped since this client's cursor,
@@ -410,13 +420,23 @@ def scrape_jobs(query_sets, lookback_hours, limit=None):
     jobs = []
     for aid in (APIFY_ACTOR_LINKEDIN, APIFY_ACTOR_CAREER):
         run = client.actor(aid).call(run_input=run_input)
-        if not run or not run.get("defaultDatasetId"):
+        ds = _run_dataset_id(run)
+        if not ds:
             continue
-        for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+        for item in client.dataset(ds).iterate_items():
             nj = _normalize_job(item, titles)
             if nj:
                 jobs.append(nj)
     return jobs
+
+def _run_dataset_id(run):
+    """The default dataset id of a finished actor run, tolerant of the apify-client
+    return shape (a pydantic Run model with .default_dataset_id, or a dict)."""
+    if not run:
+        return None
+    if isinstance(run, dict):
+        return run.get("defaultDatasetId") or run.get("default_dataset_id")
+    return getattr(run, "default_dataset_id", None) or getattr(run, "defaultDatasetId", None)
 
 # ============================ PRE-FILTER (cheap, pre-Claude) =================
 # RULE (coverage-critical): UNKNOWN NEVER KILLS. A job is filtered only on a
@@ -630,11 +650,12 @@ def _call_claude(model, skill, payload, max_tokens=1500, validate=None):
     parsed JSON. Hardened: strip stray text, validate the shape, and retry ONCE with
     a corrective nudge before giving up."""
     last_text = last_err = None
-    messages = [{"role": "user", "content": json.dumps(payload)}]
+    payload_json = json.dumps(payload, default=str)              # default=str: tolerate datetimes etc.
+    messages = [{"role": "user", "content": payload_json}]
     for attempt in range(2):                                      # initial try + one retry
         if attempt:                                               # nudge with the bad reply in context
             messages = [
-                {"role": "user", "content": json.dumps(payload)},
+                {"role": "user", "content": payload_json},
                 {"role": "assistant", "content": last_text or "{}"},
                 {"role": "user", "content": "That was not valid JSON for the schema. "
                  "Reply with ONLY the JSON object, no prose and no code fences."},
