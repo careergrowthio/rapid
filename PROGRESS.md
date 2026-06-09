@@ -12,13 +12,15 @@ status + "verified" notes as each task moves. Build order follows Handoff §8 (1
 ## Bootstrap
 - ✅ Repo seeded with all handoff artifacts (scaffold, skills, email template, SQL, docs, template docx).
 - ✅ `.gitignore`, `.env.example`, `requirements.txt` added. `.env` is gitignored; no secrets committed.
+- ✅ Module made offline-testable: Anthropic client is lazy (`_get_claude()`), skills load
+  relative to the module file, optional `.env` autoload. Importing `rapid_agent` needs no SDK/keys.
 
 ## Dev Scope of Work (Handoff §8)
 | # | Task | Status | Verified |
 |---|------|--------|----------|
 | 1 | Supabase data layer (DB stubs in rapid_agent.py) | ⬜ | needs SUPABASE_URL + SERVICE_KEY |
 | 2 | Apify scrape → shared pool (tag matched_queries; upsert MERGES) | ⬜ | needs APIFY_TOKEN |
-| 3 | Parser helpers (_is_us, _arrangement_compatible, _parse_salary_max) + unit tests | ⬜ | pure/offline — testable now |
+| 3 | Parser helpers (_is_us, _arrangement_compatible, _parse_salary_max) + unit tests | ✅ | 48 tests pass (`python3 -m pytest -q`) |
 | 4 | location_score | ⬜ | pure/offline — testable now |
 | 5 | Google Docs merge (render_resume) + refresh_base_resume | ⬜ | needs GOOGLE_SERVICE_ACCOUNT_JSON + template |
 | 6 | Postmark send + notify_ops | ⬜ | needs POSTMARK_SERVER_TOKEN |

@@ -30,8 +30,13 @@ Install: pip install anthropic supabase apify-client google-api-python-client
 Model strings: verify current values at https://docs.claude.com/en/api/overview
 """
 
-import os, json, hashlib, datetime as dt
-from anthropic import Anthropic
+import os, json, hashlib, re, datetime as dt
+
+try:                       # load .env if present (no-op when python-dotenv absent)
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 # ============================ CONFIG (locked decisions) ======================
 DAILY_CAP            = 3
@@ -56,10 +61,19 @@ JUDGMENT_FACTORS     = ("seniority", "industry", "skills", "title")  # must matc
 MODEL_MATCH  = "claude-haiku-4-5-20251001"  # high-volume scoring -> cheapest adequate model; verify string
 MODEL_RESUME = "claude-sonnet-4-6"          # rare, quality-sensitive step
 
-claude = Anthropic()
+_claude = None
+def _get_claude():
+    """Lazily construct the Anthropic client so the module imports (and the pure
+    helpers stay unit-testable) without the SDK installed or a key in the env."""
+    global _claude
+    if _claude is None:
+        from anthropic import Anthropic
+        _claude = Anthropic()
+    return _claude
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
 def load_skill(path):
-    with open(path) as f: return f.read()
+    with open(os.path.join(_HERE, path)) as f: return f.read()
 MATCHING_SKILL = load_skill("rapid_matching_skill.md")
 RESUME_SKILL   = load_skill("rapid_resume_tailoring_skill.md")
 
@@ -143,13 +157,125 @@ def prefilter(job, profile):
         return "salary_floor"
     return None
 
-def _is_us(job):                 ...  # TODO[DEV] -- unknown/unparseable location => True (lenient)
-def _arrangement_compatible(job, profile): ...  # TODO[DEV] -- arrangement not stated => True (lenient)
-def _parse_salary_max(s):        ...  # TODO[DEV] "$125,000 to $175,000" -> 175000; unparseable => None
+# --- US geography signals (heuristic, US-biased: only a CLEARLY non-US location
+#     is filtered; empty/ambiguous stays in -- "unknown never kills"). -----------
+_US_STATE_ABBR = {
+    "al","ak","az","ar","ca","co","ct","de","fl","ga","hi","id","il","in","ia",
+    "ks","ky","la","me","md","ma","mi","mn","ms","mo","mt","ne","nv","nh","nj",
+    "nm","ny","nc","nd","oh","ok","or","pa","ri","sc","sd","tn","tx","ut","vt",
+    "va","wa","wv","wi","wy","dc",
+}
+_US_STATE_NAMES = {
+    "alabama","alaska","arizona","arkansas","california","colorado","connecticut",
+    "delaware","florida","georgia","hawaii","idaho","illinois","indiana","iowa",
+    "kansas","kentucky","louisiana","maine","maryland","massachusetts","michigan",
+    "minnesota","mississippi","missouri","montana","nebraska","nevada",
+    "new hampshire","new jersey","new mexico","new york","north carolina",
+    "north dakota","ohio","oklahoma","oregon","pennsylvania","rhode island",
+    "south carolina","south dakota","tennessee","texas","utah","vermont",
+    "virginia","washington","west virginia","wisconsin","wyoming",
+    "district of columbia",
+}
+_NON_US_TOKENS = {
+    "canada","mexico","united kingdom","england","scotland","wales","ireland",
+    "london","manchester","dublin","germany","berlin","munich","france","paris",
+    "spain","madrid","barcelona","italy","rome","milan","netherlands","amsterdam",
+    "belgium","switzerland","zurich","sweden","stockholm","denmark","copenhagen",
+    "norway","oslo","finland","poland","warsaw","portugal","lisbon","austria",
+    "vienna","czech","romania","greece","ukraine","india","bangalore","bengaluru",
+    "mumbai","delhi","hyderabad","pune","chennai","gurgaon","china","beijing",
+    "shanghai","shenzhen","hong kong","taiwan","singapore","japan","tokyo",
+    "south korea","seoul","australia","sydney","melbourne","brisbane","perth",
+    "new zealand","auckland","brazil","sao paulo","argentina","buenos aires",
+    "chile","colombia","peru","toronto","vancouver","montreal","ottawa","calgary",
+    "edmonton","philippines","manila","pakistan","karachi","indonesia","jakarta",
+    "malaysia","kuala lumpur","vietnam","thailand","bangkok","south africa",
+    "nigeria","lagos","kenya","nairobi","egypt","cairo","uae","dubai","abu dhabi",
+    "qatar","israel","tel aviv","turkey","istanbul","emea","apac","latam",
+}
+
+def _is_us(job):
+    """True unless the location clearly names a non-US place. Empty/unknown -> True
+    (lenient: unknown never kills; Claude + location_score handle the gray area)."""
+    loc = (job.get("location") or "").strip()
+    if not loc:
+        return True
+    low = loc.lower()
+    if any(s in low for s in ("united states", "usa", "u.s.a", "u.s.")):
+        return True
+    if re.search(r'(^|[,\s])us($|[,\s])', low):                 # ", US" / "US," etc.
+        return True
+    if any(re.search(r'\b' + re.escape(n) + r'\b', low) for n in _US_STATE_NAMES):
+        return True
+    if any(ab in _US_STATE_ABBR for ab in re.findall(r',\s*([a-z]{2})\b', low)):
+        return True
+    if any(re.search(r'\b' + re.escape(t) + r'\b', low) for t in _NON_US_TOKENS):
+        return False                                            # stated non-US
+    return True                                                 # ambiguous -> lenient
+
+# --- Work arrangement -----------------------------------------------------------
+_REMOTE_WORDS = ("remote", "work from home", "wfh", "telecommute", "anywhere")
+_ONSITE_WORDS = ("on-site", "onsite", "on site", "in-office", "in office",
+                 "in-person", "in person")
+
+def _norm_arrangement(a):
+    a = (a or "").strip().lower()
+    if a in ("remote", "fully remote", "wfh", "work from home", "telecommute"):
+        return "remote"
+    if a in ("onsite", "on-site", "on site", "in-office", "in office",
+             "in person", "in-person"):
+        return "onsite"
+    return a                                                    # 'hybrid' and any custom value pass through
+
+def _job_arrangement(job):
+    """The job's STATED arrangement ('remote'|'hybrid'|'onsite'), or None when the
+    posting doesn't say. Inferred only from explicit signals, never guessed."""
+    text = " ".join(str(job.get(k) or "") for k in
+                    ("location", "arrangement", "work_arrangement")).lower()
+    if job.get("is_remote") is True and "hybrid" not in text:
+        return "remote"
+    if "hybrid" in text:
+        return "hybrid"
+    if any(w in text for w in _REMOTE_WORDS):
+        return "remote"
+    if any(w in text for w in _ONSITE_WORDS):
+        return "onsite"
+    return None
+
+def _arrangement_compatible(job, profile):
+    """True unless the job's STATED arrangement matches none the client accepts.
+    No client constraint, or no stated arrangement -> True (unknown never kills)."""
+    allowed = {_norm_arrangement(a) for a in (profile.get("work_arrangements") or [])}
+    if not allowed:
+        return True
+    stated = _job_arrangement(job)
+    if stated is None:
+        return True
+    return stated in allowed
+
+def _parse_salary_max(s):
+    """Largest annual dollar figure in a salary string. '$125,000 to $175,000' ->
+    175000; '$150k' -> 150000; hourly rates annualized (x2080). Unparseable -> None
+    (lenient: an unreadable salary never filters a job; the hard floor only fires on
+    a parsed value below it)."""
+    if not s:
+        return None
+    low = str(s).lower()
+    hourly = bool(re.search(r'(/\s*h(r|our)|per\s*hour|hourly|an\s*hour)', low))
+    vals = []
+    for num, suf in re.findall(r'\$?\s*(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*([kK])?', str(s)):
+        v = float(num.replace(",", ""))
+        if suf:
+            v *= 1000
+        if hourly and v < 1000:
+            v *= 2080                                           # annualize an hourly rate
+        if hourly or v >= 1000:                                # drop implausible non-hourly stragglers
+            vals.append(v)
+    return int(round(max(vals))) if vals else None
 
 # ============================ CLAUDE CALLS ===================================
 def _call_claude(model, skill, payload, max_tokens=1500):
-    resp = claude.messages.create(
+    resp = _get_claude().messages.create(
         model=model, max_tokens=max_tokens, system=skill,   # TODO[DEV]: enable prompt caching on `system`
         messages=[{"role": "user", "content": json.dumps(payload)}],
     )
