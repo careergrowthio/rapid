@@ -124,7 +124,7 @@ MVP ≈ 2-3 weeks focused; fully healthy ≈ 4-5 weeks.
 The deterministic logic is implemented in the scaffold (Appendix H); the items below are the `# TODO[DEV]` integration points. Estimates assume comfort with Python, Supabase, and external APIs.
 
 1. **Supabase data layer** (~0.5-1d) — implement the DB functions; `todays_sent_count` counts only today's `status='sent'`.
-2. **Apify scrape into the shared pool** (~1-2d) — `refresh_job_pool()` + `scrape_jobs(query_sets)`: deduped union of (location × title) queries, Fantastic Jobs actors, effective window = since-last-refresh + 1h overlap. **Tag each job with the query that found it**, and make the upsert `ON CONFLICT (content_hash) DO UPDATE` **merging `matched_queries`** (a job re-found by another client's query gains the tag). One scrape per cycle, not per client. Gate pricier sources to run infrequently.
+2. **Apify scrape into the shared pool** (~1-2d) — `refresh_job_pool()` + `scrape_jobs(query_sets)`: deduped union of (location × title) queries, Fantastic Jobs actors, effective window = since-last-refresh + 1h overlap. **Tag each job with the query that found it**, and make the upsert `ON CONFLICT (content_hash) DO UPDATE` **merging `matched_queries`** (a job re-found by another client's query gains the tag). One scrape per cycle, not per client. Gate pricier sources to run infrequently. *(As-built: see §8.1 — remote clients search nationally via query buckets, and the upsert is select-then-insert/merge because the live DB lacked the `content_hash` unique index.)*
 3. **Three parser helpers** (~0.5d) — `_is_us`, `_arrangement_compatible`, `_parse_salary_max`. Pure, testable.
 4. **`location_score`** (~0.5-1d) — remote match → high; else distance bands from preferred locations.
 5. **Google Docs merge + master read (`render_resume`, `refresh_base_resume`)** (~1-2d) — copy the **global template** Doc and fill its placeholders from `tailored_resume` (the client's facts already live in the cached `base_resume`; do not copy the master at render time). The template holds one experience block with 3 bullet lines — duplicate the block per experience entry and per bullet (variable counts) and remove empty sections rather than leaving headings. Write the result to the **output** Drive folder and return the link. Plus a one-time `refresh_base_resume()` that reads the **master** from Drive (Doc ID/URL stored in `clients.resume_url`) and caches it to `base_resume` on activation/update.
@@ -137,6 +137,50 @@ The deterministic logic is implemented in the scaffold (Appendix H); the items b
 **Cost controls (required):** model tiering (cheap for matching, stronger for resume), prompt-cache the skills, keep the deterministic pre-filter strictly before any Claude call, shared pool + recency window + per-client scoring cursor.
 
 **Definition of done (MVP):** (1) the Mesa test client runs end to end and correctly returns few/zero strong matches with the health view flagging it; (2) a normal client gets up to 3 emailed matches/day, strong first, each with a truthfully tailored resume in the configured template format + apply link, nothing below 70% or older than a week, no duplicates; (3) runs hourly on schedule, costs bounded by the controls above, errors logged not fatal.
+
+## 8.1 As-built status & integration findings
+*Added during integration. The locked spec above is unchanged; this records what was
+actually implemented and what reality disagreed with. Live build state lives in
+`PROGRESS.md` (the running source of truth); this is the durable summary.*
+
+**Implemented & verified live (Tasks 1–4, 7, 8):** the Supabase data layer, the Apify
+scrape, the parsers, `location_score`, hardened Claude parsing, and bounded concurrency
+all run against the live project. Mesa runs the full scrape→score path and correctly
+yields zero matches, with the funnel naming the gate (geography + relocation) —
+acceptance gate #1. Test suite: 103 passing.
+
+**Pinned actor IDs** (the spec said "reuse the existing actor IDs" but never listed them):
+- LinkedIn — `vIGxjRrHqDTPuE6M4` (fantastic-jobs/advanced-linkedin-job-search-api)
+- Career sites/ATS — `s3dtSTZSZWFtAVLn5` (fantastic-jobs/career-site-job-listing-api)
+- Actor input: `titleSearch[]` (Boolean `:*` prefix queries), `locationSearch[]`,
+  `timeRange` (`"Nh"`/`"Nd"`), `limit` (min 10), `includeAi`, `descriptionType:"text"`.
+
+**New locked decisions (from integration reality):**
+- **Remote clients search nationally.** Filtering a remote client's jobs by their home
+  city returns ~0 (Mesa, AZ → 0 jobs; titles-only → 10). `get_all_active_query_sets`
+  now returns query *buckets*: remote-accepting clients → `locationSearch=["United
+  States"]` (validated 10/10 US jobs); strictly on-site/hybrid clients → their
+  `preferred_locations`. Provenance is still re-derived per job from `titleSearch`.
+- **Upsert is select-then-insert/merge, not `ON CONFLICT`.** The live `jobs` table was
+  missing the `content_hash` unique index (migration 02's index never applied), so
+  PostgREST `ON CONFLICT` failed (`42P10`). The agent no longer depends on the
+  constraint; `sql/04` restores it as hygiene.
+
+**Integration fixes worth knowing:** `apify-client` 2.20 returns a pydantic `Run`
+(not a dict); Claude payloads serialize with `default=str` (DB rows carry datetimes);
+the match email's salary line no longer doubles the unit ("per year PER YEAR").
+
+**Deferred / blocked on human steps:**
+- **Task 5 (Google Docs resume render)** — not built; deferred pending
+  `GOOGLE_SERVICE_ACCOUNT_JSON`. `render_resume` raises rather than emailing a dead
+  link, so delivery leaves an alertable `pending` row.
+- **Email send** — code reaches Postmark and authenticates, but `From
+  rapidnotifications@careergrowth.io` is not yet a confirmed Sender Signature (live
+  `ErrorCode 400`). Confirm the signature / verify the domain to unblock.
+- **SQL** — run `sql/04_unique_match_idempotency.sql` and `sql/05_rls_policies.sql` in
+  the Supabase SQL Editor (the service key can't run DDL).
+- **Deploy (Task 10)** — `Dockerfile` + `docs/DEPLOY.md` ready (Render/Railway hourly
+  cron); not yet stood up.
 
 ## 9. Client-provided inputs & configuration
 These are supplied by the client; treat them as configuration/secrets and confirm receipt before building the integrations that depend on them.

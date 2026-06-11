@@ -1,43 +1,46 @@
-# Rapid — Handover Checklist (fill in the blanks)
+# Rapid — Handover Checklist (AS-BUILT status)
 
-*Complete this, then send it to your developer along with the files listed in section 6. Anything you can't fill, flag so the dev can help.*
+*Originally a fill-in template for the developer. Updated during integration to show
+current status. ✅ = done/verified this session, ⏳ = waiting on a human step.
+Live build state is in `PROGRESS.md`; the durable summary is handoff §8.1.*
 
 ---
 
 ## 1. Credentials & keys  (keep secret — share via a password manager, not email)
 
 ```
-Anthropic API key:                 ____________________________________
-Apify token:                       ____________________________________
-Supabase Project URL:              ____________________________________
-Supabase service_role key:         ____________________________________   (server-side only)
-Supabase anon/public key:          ____________________________________   (dashboard)
-Google service account JSON:       [ ] attached as a file
-Email provider API key:            ____________________________________   (Postmark Server API token)
-Sending from-address / domain:     ____________________________________   (e.g. jobs@careergrowth.io)
+Anthropic API key:                 ✅ provided + verified (preflight OK)
+Apify token:                       ✅ provided + verified (auth as 'careergrowth')
+Supabase Project URL:              ✅ provided + verified
+Supabase service_role key:         ✅ provided + verified (server-side only)
+Supabase anon/public key:          ⏳ needed by the DASHBOARD (not the agent) — get from Supabase API settings
+Google service account JSON:       ⏳ NOT yet provided — blocks Task 5 (resume render)
+Email provider API key:            ✅ provided + verified (Postmark Server token)
+Sending from-address / domain:     rapidnotifications@careergrowth.io
+                                   ⏳ BLOCKER: not yet a confirmed Postmark Sender Signature (live ErrorCode 400)
 ```
 
 ## 2. Decisions to set
 
 ```
-Email provider:                    [x] Postmark  (use the Transactional stream)
-   Verify sending domain in Postmark (DKIM + Return-Path) early -- DNS can take time   [ ] started   [ ] verified
-Agent hosting platform:            [ ] Railway  [ ] Render  [ ] Fly  [ ] other: __________
-Schedule timezone (for 6am-11pm):  ____________________   (e.g. America/Phoenix)
+Email provider:                    [x] Postmark  (Transactional / "outbound" stream — wired)
+   Verify sending domain in Postmark (DKIM + Return-Path) early -- DNS can take time   [x] started   [ ] verified  <-- ⏳ DO THIS NEXT (unblocks all email)
+Agent hosting platform:            [ ] Railway  [ ] Render  [ ] Fly  [ ] other: __________  <-- ⏳ pick one; Dockerfile + docs/DEPLOY.md ready
+Schedule timezone (for 6am-11pm):  America/Phoenix   (CAP_TIMEZONE in code; cron: 0 6-23 * * 1-5)
 Weekend run cadence (optional):    [ ] none (Mon covers weekend)  [ ] every 3h  [ ] hourly
    (shared pool makes weekend runs cheap; keeps weekend postings inside the ~1hr promise)
-Will you build Task 3 (the 3 parser functions) yourself?   [ ] Yes   [ ] No, dev does it
+Will you build Task 3 (the 3 parser functions) yourself?   [ ] Yes   [x] No — ✅ done + unit-tested
 ```
 *(Everything else — the 70% bar, Strong/Possible tiers, 3/day cap, 24h lookback, freshness, shared pool — is already locked in the handoff doc; nothing to decide.)*
 
 ## 3. Google Docs resume template + master resumes
 
 ```
-Resume template Google Doc ID:     ____________________________________
-Template placeholder field names:  ____________________________________
+Resume template Google Doc ID:     1GZB9vI2wJmf5vRqrB0lACpiSm8sb2uZS   (RESUME_TEMPLATE_DOC_ID, in .env)
+Template placeholder field names:  ⏳ confirm the {{placeholders}} in the template Doc when wiring Task 5
    (list every {{placeholder}} in the template, e.g. {{FULL_NAME}}, {{SUMMARY}},
     {{JOB_TITLE}}, {{SKILLS}} — the dev maps the skill output to these)
-Template shared with the Google service account?   [ ] Yes (editor access)
+Template shared with the Google service account?   [ ] Yes (editor access)   <-- ⏳ needed once the service account exists
 
 Drive folder where client MASTER resumes live:  1YzCQF-V2K1LLbGiZgvsov7KEzoTqX9YT   (read access)
    (link: https://drive.google.com/drive/folders/1YzCQF-V2K1LLbGiZgvsov7KEzoTqX9YT)
@@ -89,16 +92,33 @@ Approx. number of active clients:      __________
 Who validates the migrated data?       __________  (you / dev)
 ```
 
-## 6. Files to send the developer  (the package)
+## 6. Repo layout (as-built — the package is now the repo)
 
 ```
-[ ] Rapid_Complete_Handoff.md        — the master doc (read this first; contains all of the below in appendices)
-[ ] rapid_supabase_schema.sql        — database (run once)
-[ ] migration_shared_job_pool.sql    — shared-pool migration (run once, after schema)
-[ ] seed_mesa_test_client.sql        — test client for the acceptance test
-[ ] rapid_matching_skill.md          — SKILL: how Claude scores a job
-[ ] rapid_resume_tailoring_skill.md  — SKILL: how Claude tailors a resume
-[ ] rapid_agent.py                   — the pipeline scaffold (the dev finishes the TODO[DEV] items)
+docs/Rapid_Complete_Handoff.md       — master doc (see §8.1 for as-built status)
+sql/01_rapid_supabase_schema.sql     — database (run once) [applied]
+sql/02_migration_shared_job_pool.sql — shared-pool migration [applied — but content_hash index missing in live, see 04]
+sql/03_seed_mesa_test_client.sql     — Mesa test client [applied]
+sql/04_unique_match_idempotency.sql  — ⏳ RUN: match uniqueness + missing jobs.content_hash index
+sql/05_rls_policies.sql              — ⏳ RUN: RLS before the dashboard reads the tables
+rapid_matching_skill.md              — SKILL: how Claude scores a job
+rapid_resume_tailoring_skill.md      — SKILL: how Claude tailors a resume
+rapid_agent.py                       — the pipeline (TODO[DEV] done except Task 5 / Google)
+rapid_match_email_template.md        — email copy (wired into send_match_email)
+scripts/preflight.py                 — read-only credential checker
+tests/                               — 103 passing unit tests
+Dockerfile, docs/DEPLOY.md           — deploy (hourly cron on Render/Railway)
+PROGRESS.md                          — live build state (source of truth)
 ```
 
-*The two skill files (matching + resume) are the "brain" — make sure both go with the scaffold, since the scaffold loads them by filename.*
+## 7. What's left to go live (the short list)
+```
+[ ] Confirm Postmark Sender Signature for rapidnotifications@careergrowth.io (or verify domain DKIM)
+[ ] Run sql/04 + sql/05 in the Supabase SQL Editor
+[ ] Provide Google service account JSON  -> then build Task 5 (resume render)
+[ ] Pick a host + deploy per docs/DEPLOY.md (hourly cron, env vars)
+[ ] Full end-to-end shadow run on Mesa, then >=1 week shadow before any real client
+```
+
+*The two skill files (matching + resume) are the "brain" — the scaffold loads them by
+filename, so they must sit beside `rapid_agent.py`.*
