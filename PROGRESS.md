@@ -36,13 +36,21 @@ Total tests: **103 pass** (`python3 -m pytest -q`).
    `rapidnotifications@careergrowth.io` (or verify the `careergrowth.io` domain with
    DKIM/Return-Path). Until then every send 422s. After confirming, the email path is
    done — code already hard-routes To = TEST_RECIPIENT_OVERRIDE.
-2. **Run the SQL patches** in Supabase → SQL Editor: `sql/04_unique_match_idempotency.sql`
-   (matches uniqueness + jobs.content_hash index) and `sql/05_rls_policies.sql` (RLS,
-   before anything client-facing reads the tables). Service key can't run DDL.
+2. **Run the SQL patches** in Supabase → SQL Editor (exact SQL handed to owner 2026-06-12):
+   `sql/04_unique_match_idempotency.sql` (matches uniqueness + jobs.content_hash index)
+   and `sql/05_rls_policies.sql` (RLS, before anything client-facing reads the tables).
+   Service key can't run DDL. ⏳ awaiting confirmation they ran.
 3. **Task 5 (Google Docs resume render)** — still deferred; provide
    GOOGLE_SERVICE_ACCOUNT_JSON to unblock. Until then `render_resume` raises and
    delivery leaves an alertable 'pending' row instead of emailing a dead link.
 4. **Deploy** — follow `docs/DEPLOY.md` (Render/Railway hourly cron, env vars).
+
+## Docs synced to as-built reality (2026-06-12)
+- `docs/Rapid_Complete_Handoff.md` — added §8.1 "As-built status & integration findings"
+  (pinned actor IDs, national-search decision, select-then-insert upsert, integration
+  fixes, deferred/blocked items). Legacy n8n §2 left intact (it documents the old system).
+- `docs/Rapid_Handover_Checklist.md` — converted to as-built status (credentials
+  provided/verified, blockers flagged, repo layout, "what's left to go live").
 
 ## Design decision implemented this session
 - **Remote clients search nationally.** `get_all_active_query_sets` now returns query
@@ -63,21 +71,23 @@ Total tests: **103 pass** (`python3 -m pytest -q`).
   (scoped to Mesa queries) → `prefilter` (killed 5 non-US jobs BEFORE any Claude call —
   cost control works) → `score_job` (Claude). CPG roles scored highest (industry 95,
   skills 88, salary 100). Mesa correctly yields 0 matches = acceptance gate #1.
-- **3 real bugs found + fixed via live testing:**
+- **4 real bugs found + fixed via live testing:**
   1. `apify-client` 2.20 returns a pydantic `Run` (not a dict) → added `_run_dataset_id`.
   2. Live `jobs` table has NO unique constraint on content_hash (migration 02 not fully
      applied) → rewrote `upsert_jobs` as select-then-insert/merge (no ON CONFLICT dep).
   3. DB-hydrated jobs carry `datetime` → `_call_claude` now `json.dumps(..., default=str)`.
+  4. Match email salary line printed "per year PER YEAR" (salary string already carries
+     the unit) → email renderer no longer appends the template's hardcoded "PER YEAR".
 - **Deal-breaker engine verified CORRECT:** a "remote"-flagged Tropicana NAM role was
   knocked out because the JD body said "must be located in Cincinnati/Charlotte or
   willing to relocate." Skill read the description and cited it verbatim. Deep reading
   beats the surface remote flag — working as designed.
-- **2 findings to decide on (not blocking):**
-  - (a) For REMOTE-only clients, scraping with `locationSearch=[home city]` returns ~0
-    (Mesa, AZ → 0 jobs); titles-only returned 10. Remote clients likely need national
-    search, not home-city filtering. Design question for `get_all_active_query_sets`.
-  - (b) Consider applying a unique index on `jobs(content_hash)` (additive) to harden
-    dedup; the code no longer requires it but it's good hygiene.
+- **2 findings — both now RESOLVED:**
+  - (a) ✅ FIXED. For REMOTE-only clients, `locationSearch=[home city]` returned ~0
+    (Mesa, AZ → 0); now remote clients search nationally (`locationSearch=["United
+    States"]`, validated 10/10 US jobs). See "Design decision" above.
+  - (b) ✅ ADDRESSED. `jobs(content_hash)` unique index added to `sql/04` (awaiting the
+    owner to run it); code no longer requires it but it's good hygiene.
 - Preflight result (2026-06-09, open-network session): **ALL FOUR LIVE KEYS OK** via
   `scripts/preflight.py` (read-only, no email, near-zero cost):
   - Anthropic — model `claude-haiku-4-5` reachable.
